@@ -1,0 +1,32 @@
+[package]
+name = "ventogpustack"
+version = "0.1.0"
+edition = "2021"
+description = "VentoGPUStack — GPU 机群监控与模型服务调度平台"
+
+[dependencies]
+pingora = { version = "0.9.0", features = ["proxy", "rustls"] }
+pingora-error = "0.9.0"
+pingora-http = "0.9.0"
+pingora-core = "0.9.0"
+arc-swap = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "~1.49", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "process"] }
+jsonwebtoken = "9"
+argon2 = "0.5"
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+env_logger = "0.11"
+bytes = "1"
+rand = "0.8"
+clap = { version = "4", features = ["derive"] }
+async-trait = "0.1"
+russh = "0.65"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "symbols"

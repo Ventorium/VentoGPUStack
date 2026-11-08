@@ -1,0 +1,21 @@
+[Unit]
+Description=VentoGPUStack - GPU 机房管理网关
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=erguotou
+WorkingDirectory=/opt/ventogpustack
+ExecStart=/opt/ventogpustack/bin/ventogpustack run --config /opt/ventogpustack/ventogpustack.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# dsh headless（LLM 后端）需要访问 ~/.dsh
+Environment=HOME=/home/erguotou
+Environment=PATH=/home/erguotou/.nvm/versions/node/v24.22.2/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target

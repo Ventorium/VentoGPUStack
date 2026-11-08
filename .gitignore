@@ -1,0 +1,13 @@
+/target
+*.log
+.DS_Store
+node_modules/
+collect.js
+package.json
+package-lock.json
+*.csv
+__pycache__/
+config/admin.yaml
+config/services.yaml
+config/servers.yaml
+.dsh/

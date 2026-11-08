@@ -1,0 +1,21 @@
+# VentoGPUStack 主配置
+version: 1
+admin_listen: "0.0.0.0:8900"
+threads: 4
+grace_period_seconds: 30
+upgrade_sock: "/opt/ventogpustack/upgrade.sock"
+pid_file: "/opt/ventogpustack/ventogpustack.pid"
+admin_file: "/opt/ventogpustack/admin.yaml"
+servers_file: "/opt/ventogpustack/servers.yaml"
+services_file: "/opt/ventogpustack/services.yaml"
+log_dir: "/opt/ventogpustack/logs"
+refresh_interval_secs: 30
+ssh_timeout_secs: 25
+ssh_concurrency: 8
+error_log: ""
+
+llm:
+  enabled: true
+  command: "dsh"
+  profile: "headless"
+  timeout_secs: 300

@@ -1,0 +1,6 @@
+# 服务器清单模板：复制为 config/servers.yaml 并填入真实 host/密码后使用。
+# servers.yaml 含明文凭据，已被 .gitignore 排除，不会入库。
+# 机器不可达时设 enabled: false 跳过采集。
+servers:
+  - { id: 1, name: node01, host: 192.0.2.1, port: 22, user: USERNAME, password: "CHANGE_ME", notes: "", enabled: true }
+  - { id: 2, name: node02, host: 192.0.2.2, port: 22, user: USERNAME, password: "CHANGE_ME", notes: "", enabled: true }

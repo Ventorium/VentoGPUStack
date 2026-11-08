@@ -1,0 +1,1174 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VentoGPUStack · GPU 机房管理</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<style>
+  :root{
+    --background:#ffffff; --foreground:#18181b;
+    --card:#ffffff; --muted:#f4f4f5; --muted-foreground:#71717a;
+    --border:#e4e4e7; --input:#d4d4d8;
+    --primary:#18181b; --primary-foreground:#fafafa;
+    --ring:rgba(24,24,27,.14); --radius:8px;
+    --ok:#16a34a; --warn:#d97706; --err:#dc2626;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:var(--background); color:var(--foreground);
+    font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    font-size:14px; line-height:1.5; -webkit-font-smoothing:antialiased;
+  }
+  .hidden{display:none!important}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+
+  /* ---------- buttons ---------- */
+  .btn{
+    display:inline-flex; align-items:center; justify-content:center; gap:6px;
+    height:36px; padding:0 16px; border-radius:6px; border:1px solid transparent;
+    font-size:13px; font-weight:500; cursor:pointer; white-space:nowrap;
+    transition:background .12s,border-color .12s,color .12s; background:transparent; color:var(--foreground);
+    font-family:inherit;
+  }
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .btn-primary{background:var(--primary);color:var(--primary-foreground);border-color:var(--primary)}
+  .btn-primary:hover:not(:disabled){background:#27272a}
+  .btn-outline{border-color:var(--border);background:#fff}
+  .btn-outline:hover:not(:disabled){background:var(--muted)}
+  .btn-ghost{background:transparent}
+  .btn-ghost:hover:not(:disabled){background:var(--muted)}
+  .btn-danger{color:var(--err);border-color:var(--border);background:#fff}
+  .btn-danger:hover:not(:disabled){background:#fef2f2;border-color:#fecaca}
+  .btn-sm{height:30px;padding:0 10px;font-size:12px;border-radius:6px}
+  .btn-xs{height:26px;padding:0 8px;font-size:12px;border-radius:6px}
+
+  /* ---------- inputs ---------- */
+  .label{display:block;font-size:12px;font-weight:500;margin-bottom:6px;color:var(--foreground)}
+  .input,.select,.textarea{
+    width:100%; background:#fff; border:1px solid var(--border); border-radius:6px;
+    padding:0 12px; height:36px; font-size:13px; color:var(--foreground); font-family:inherit;
+    transition:border-color .12s,box-shadow .12s;
+  }
+  .textarea{height:auto;padding:8px 12px;resize:vertical;line-height:1.5}
+  .input:focus,.select:focus,.textarea:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px var(--ring)}
+  .input::placeholder,.textarea::placeholder{color:#a1a1aa}
+  .checkbox{width:16px;height:16px;accent-color:var(--primary);cursor:pointer}
+  .check-row{display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;user-select:none}
+  .hint{font-size:12px;color:var(--muted-foreground);margin-top:4px}
+
+  /* ---------- layout ---------- */
+  .topbar{
+    height:56px; border-bottom:1px solid var(--border);
+    display:flex; align-items:center; justify-content:space-between;
+    padding:0 24px; background:#fff; position:sticky; top:0; z-index:20;
+  }
+  .brand{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:600;letter-spacing:-.01em}
+  .brand-mark{width:26px;height:26px;border-radius:6px;display:block;flex:none;object-fit:contain}
+  .tabs{border-bottom:1px solid var(--border);background:#fff}
+  .tabs-inner{max-width:1280px;margin:0 auto;padding:0 24px;display:flex;gap:4px}
+  .tab{
+    display:inline-flex;align-items:center;height:40px;padding:0 14px;
+    font-size:13px;color:var(--muted-foreground);cursor:pointer;border:none;background:none;
+    border-bottom:2px solid transparent;margin-bottom:-1px;font-family:inherit;transition:color .12s;
+  }
+  .tab:hover{color:var(--foreground)}
+  .tab.active{color:var(--foreground);font-weight:500;border-bottom-color:var(--primary)}
+  .container{max-width:1280px;margin:0 auto;padding:24px}
+  .page-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+  .page-title{font-size:16px;font-weight:600;letter-spacing:-.01em}
+  .page-sub{font-size:12px;color:var(--muted-foreground);margin-top:2px}
+
+  /* ---------- table / card ---------- */
+  .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius)}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  thead th{
+    text-align:left;font-weight:500;font-size:12px;color:var(--muted-foreground);
+    padding:10px 16px;border-bottom:1px solid var(--border);background:#fafafa;
+  }
+  tbody td{padding:10px 16px;border-bottom:1px solid var(--muted);vertical-align:middle}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:#fafafa}
+  .cell-main{font-weight:500}
+  .cell-sub{font-size:12px;color:var(--muted-foreground);margin-top:2px}
+  .empty{padding:56px 0;text-align:center;color:var(--muted-foreground);font-size:13px}
+  .actions{display:flex;gap:4px;justify-content:flex-end;align-items:center;flex-wrap:wrap}
+
+  /* ---------- stat cards ---------- */
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
+  .stat{padding:14px 16px}
+  .stat-k{font-size:12px;color:var(--muted-foreground)}
+  .stat-v{font-size:22px;font-weight:600;margin-top:4px;letter-spacing:-.02em}
+  .stat-s{font-size:12px;color:var(--muted-foreground);margin-top:2px}
+
+  /* ---------- gpu bar ---------- */
+  .gpu-row{display:grid;grid-template-columns:64px 1fr 92px 84px;gap:10px;align-items:center;padding:7px 0;border-bottom:1px solid var(--muted);font-size:12px}
+  .gpu-row:last-child{border-bottom:none}
+  .bar{height:8px;background:var(--muted);border-radius:99px;overflow:hidden}
+  .bar>i{display:block;height:100%;background:var(--primary);border-radius:99px}
+  .bar>i.warn{background:var(--warn)}
+  .bar>i.hot{background:var(--err)}
+
+  /* ---------- badges ---------- */
+  .badge{
+    display:inline-flex;align-items:center;gap:4px;border-radius:999px;
+    padding:2px 10px;font-size:11px;font-weight:500;line-height:18px;white-space:nowrap;
+  }
+  .badge-on{background:var(--primary);color:var(--primary-foreground)}
+  .badge-off{border:1px solid var(--input);color:var(--muted-foreground);background:#fff}
+  .badge-ok{background:#f0fdf4;color:var(--ok);border:1px solid #bbf7d0}
+  .badge-warn{background:#fffbeb;color:var(--warn);border:1px solid #fde68a}
+  .badge-err{background:#fef2f2;color:var(--err);border:1px solid #fecaca}
+  .badge-muted{background:var(--muted);color:var(--muted-foreground)}
+
+  /* ---------- modal ---------- */
+  .overlay{
+    position:fixed;inset:0;background:rgba(24,24,27,.45);z-index:50;
+    display:flex;align-items:center;justify-content:center;padding:24px;
+  }
+  .modal{
+    background:#fff;border-radius:10px;width:100%;max-width:680px;max-height:90vh;
+    display:flex;flex-direction:column;box-shadow:0 20px 50px rgba(24,24,27,.25);
+  }
+  .modal-wide{max-width:880px}
+  .modal-head{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border)}
+  .modal-title{font-size:15px;font-weight:600}
+  .modal-x{border:none;background:none;font-size:18px;cursor:pointer;color:var(--muted-foreground);width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center}
+  .modal-x:hover{background:var(--muted);color:var(--foreground)}
+  .modal-body{padding:20px;overflow-y:auto}
+  .modal-foot{display:flex;justify-content:flex-end;gap:8px;padding:14px 20px;border-top:1px solid var(--border)}
+  .field{margin-bottom:16px}
+  .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .section-title{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--muted-foreground);margin:20px 0 10px}
+  .section-title:first-child{margin-top:0}
+
+  /* ---------- drawer ---------- */
+  .drawer-backdrop{position:fixed;inset:0;background:rgba(24,24,27,.35);z-index:40}
+  .drawer{
+    position:fixed;top:0;right:0;bottom:0;width:520px;max-width:96vw;background:#fff;z-index:45;
+    border-left:1px solid var(--border);box-shadow:-12px 0 32px rgba(24,24,27,.12);
+    display:flex;flex-direction:column;animation:drawer-in .18s ease-out;
+  }
+  @keyframes drawer-in{from{transform:translateX(40px);opacity:0}to{transform:none;opacity:1}}
+  .drawer-head{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border)}
+  .drawer-body{padding:20px;overflow-y:auto;flex:1}
+  .kv{display:grid;grid-template-columns:110px 1fr;gap:6px 12px;font-size:13px}
+  .kv dt{color:var(--muted-foreground)}
+  .kv dd{word-break:break-all}
+
+  /* ---------- login ---------- */
+  .login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;background:#fafafa;padding:24px}
+  .login-card{background:#fff;border:1px solid var(--border);border-radius:10px;width:100%;max-width:360px;padding:32px 28px;box-shadow:0 4px 16px rgba(24,24,27,.06)}
+  .login-brand{display:flex;align-items:center;gap:10px;justify-content:center;margin-bottom:6px}
+  .login-title{font-size:16px;font-weight:600;text-align:center}
+  .login-sub{font-size:12px;color:var(--muted-foreground);text-align:center;margin-bottom:24px}
+
+  /* ---------- toast ---------- */
+  .toast{
+    position:fixed;bottom:24px;right:24px;z-index:80;
+    background:var(--primary);color:var(--primary-foreground);
+    padding:10px 16px;border-radius:8px;font-size:13px;box-shadow:0 8px 24px rgba(24,24,27,.25);
+    animation:toast-in .18s ease-out;max-width:420px;
+  }
+  .toast.err{background:#fff;color:var(--foreground);border:1px solid var(--input)}
+  @keyframes toast-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+
+  .code{background:var(--muted);border-radius:4px;padding:1px 5px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
+  .user-chip{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted-foreground)}
+  .steps{list-style:none}
+  .steps li{display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--muted);font-size:13px}
+  .steps li:last-child{border-bottom:none}
+  .spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .chips{display:flex;gap:6px;flex-wrap:wrap}
+  .chip{border:1px solid var(--border);border-radius:999px;padding:3px 12px;font-size:12px;background:#fff;cursor:pointer}
+  .chip.active{background:var(--primary);color:var(--primary-foreground);border-color:var(--primary)}
+  pre.block{margin:0;padding:12px;background:#fafafa;border:1px solid var(--border);border-radius:6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.7;white-space:pre-wrap;word-break:break-all;max-height:40vh;overflow:auto}
+</style>
+</head>
+<body>
+
+<!-- ============ 登录 ============ -->
+<div id="loginView" class="login-wrap hidden">
+  <div class="login-card">
+    <div class="login-brand"><img class="brand-mark" src="/logo.png" alt=""><span>VentoGPUStack</span></div>
+    <div class="login-sub">GPU 机房管理网关</div>
+    <div class="field"><label class="label">用户名</label><input class="input" id="loginUser" value="admin" autocomplete="username"></div>
+    <div class="field"><label class="label">密码</label><input class="input" id="loginPass" type="password" autocomplete="current-password"></div>
+    <button class="btn btn-primary" style="width:100%" onclick="doLogin()">登 录</button>
+  </div>
+</div>
+
+<!-- ============ 主界面 ============ -->
+<div id="appView" class="hidden">
+  <div class="topbar">
+    <div class="brand"><img class="brand-mark" src="/logo.png" alt=""><span>VentoGPUStack</span><span class="badge badge-muted">GPU 机房管理</span></div>
+    <div style="display:flex;align-items:center;gap:12px">
+      <span class="user-chip" id="userChip"></span>
+      <button class="btn btn-ghost btn-sm" onclick="doLogout()">退出</button>
+    </div>
+  </div>
+  <div class="tabs"><div class="tabs-inner" id="tabbar"></div></div>
+  <div class="container">
+
+    <!-- 概览 -->
+    <section id="page-overview" class="hidden">
+      <div class="page-head">
+        <div><div class="page-title">机群概览</div><div class="page-sub">机器 · GPU · 显存 · 内存 · 磁盘 · 驱动分布</div></div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-outline btn-sm" id="btnRefreshAll" onclick="refreshAll()">⟳ 全量刷新</button>
+        </div>
+      </div>
+      <div class="stats" id="statCards"></div>
+      <div class="card" style="margin-bottom:16px">
+        <div class="section-title" style="padding:14px 16px 0">驱动 / CUDA 版本分布（点击可在「驱动升级」页预填）</div>
+        <div id="driverDist" style="padding:12px 16px 16px" class="chips"></div>
+      </div>
+      <div class="card">
+        <table>
+          <thead><tr><th>服务器</th><th>GPU</th><th>显存</th><th>驱动 / CUDA</th><th>内存</th><th>磁盘</th><th>状态</th></tr></thead>
+          <tbody id="ovRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 服务器 -->
+    <section id="page-servers" class="hidden">
+      <div class="page-head">
+        <div><div class="page-title">服务器管理</div><div class="page-sub">SSH 直连采集 · 点击行查看详情</div></div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-outline btn-sm" onclick="loadServers()">⟳ 刷新</button>
+          <button class="btn btn-primary btn-sm" onclick="openServerModal()">＋ 添加服务器</button>
+        </div>
+      </div>
+      <div class="card">
+        <table>
+          <thead><tr><th>名称</th><th>Host</th><th>GPU</th><th>显存</th><th>驱动 / CUDA</th><th>内存</th><th>磁盘</th><th>状态</th><th></th></tr></thead>
+          <tbody id="serverRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 驱动升级 -->
+    <section id="page-driver" class="hidden">
+      <div class="page-head">
+        <div><div class="page-title">驱动升级研判</div><div class="page-sub">全机群驱动 / CUDA 矩阵 + AI 兼容性分析（考虑在跑负载）</div></div>
+      </div>
+      <div class="card" style="margin-bottom:16px;padding:16px;display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+        <div style="width:220px"><label class="label">目标驱动版本</label><input class="input mono" id="drvTarget" placeholder="如 570.124.06"></div>
+        <div style="width:200px"><label class="label">目标 CUDA（可选）</label><input class="input mono" id="drvCuda" placeholder="如 12.4"></div>
+        <button class="btn btn-primary" id="btnAnalyze" onclick="analyzeDriver()">AI 研判升级兼容性</button>
+        <span class="hint" style="margin-bottom:8px">AI 分析约需 10–40 秒；失败自动回退规则引擎。</span>
+      </div>
+      <div id="drvResult" class="hidden" style="margin-bottom:16px">
+        <div class="section-title" id="drvResultTitle">研判结果</div>
+        <div class="card">
+          <table>
+            <thead><tr><th>服务器</th><th>当前驱动</th><th>当前 CUDA</th><th>结论</th><th>需先停止的服务</th><th>风险</th><th>理由</th></tr></thead>
+            <tbody id="drvRows"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="section-title">当前驱动矩阵</div>
+      <div class="card">
+        <table>
+          <thead><tr><th>服务器</th><th>驱动</th><th>CUDA</th><th>GPU</th><th>显存占用</th><th>在跑进程</th><th>在跑模型</th></tr></thead>
+          <tbody id="drvMatrix"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 模型服务 -->
+    <section id="page-services" class="hidden">
+      <div class="page-head">
+        <div><div class="page-title">模型服务调度</div><div class="page-sub">注册 · 启停 · 迁移（蓝绿）· 模型拷贝 · 单卡/多卡（TP）</div></div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-outline btn-sm" onclick="loadServices()">⟳ 刷新</button>
+          <button class="btn btn-outline btn-sm" id="btnDiscover" onclick="runDiscover()">🔍 智能检测</button>
+          <button class="btn btn-primary btn-sm" onclick="openServiceModal()">＋ 注册模型服务</button>
+        </div>
+      </div>
+      <div class="card">
+        <table>
+          <thead><tr><th>服务</th><th>模型路径</th><th>部署方式</th><th>所在机器</th><th>端口</th><th>TP</th><th>状态</th><th></th></tr></thead>
+          <tbody id="serviceRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 设置 -->
+    <section id="page-settings" class="hidden">
+      <div class="page-head">
+        <div><div class="page-title">全局设置</div><div class="page-sub">采集间隔 · SSH 参数 · LLM 后端（热重载生效）</div></div>
+        <button class="btn btn-primary btn-sm" onclick="saveSettings()">保存设置</button>
+      </div>
+      <div class="card" style="max-width:640px">
+        <div style="padding:20px">
+          <div class="grid-3">
+            <div class="field"><label class="label">采集间隔（秒）</label><input class="input mono" id="setRefresh" type="number"></div>
+            <div class="field"><label class="label">SSH 超时（秒）</label><input class="input mono" id="setSshTimeout" type="number"></div>
+            <div class="field"><label class="label">SSH 并发</label><input class="input mono" id="setConc" type="number"></div>
+          </div>
+          <div class="section-title">LLM 后端（dsh headless）</div>
+          <div class="grid-2">
+            <div class="field"><label class="label">命令</label><input class="input mono" id="setLlmCmd"></div>
+            <div class="field"><label class="label">Profile</label><input class="input mono" id="setLlmProfile"></div>
+            <div class="field"><label class="label">超时（秒）</label><input class="input mono" id="setLlmTimeout" type="number"></div>
+            <div class="field" style="display:flex;align-items:center;padding-top:16px"><label class="check-row"><input type="checkbox" class="checkbox" id="setLlmEnabled"> 启用 LLM</label></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 日志 -->
+    <section id="page-audit" class="hidden">
+      <div class="page-head">
+        <div><div class="page-title">操作日志</div><div class="page-sub">JSONL 审计记录</div></div>
+        <button class="btn btn-outline btn-sm" onclick="loadAudit()">⟳ 刷新</button>
+      </div>
+      <div class="card">
+        <table>
+          <thead><tr><th>时间</th><th>用户</th><th>操作</th><th>对象</th><th>详情</th><th>来源 IP</th></tr></thead>
+          <tbody id="auditRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+  </div>
+</div>
+
+<!-- ============ 服务器详情抽屉 ============ -->
+<div id="drawerBackdrop" class="drawer-backdrop hidden" onclick="closeDrawer()"></div>
+<div id="drawer" class="drawer hidden">
+  <div class="drawer-head">
+    <div><div class="modal-title" id="drawerTitle">服务器详情</div><div class="cell-sub" id="drawerSub"></div></div>
+    <button class="modal-x" onclick="closeDrawer()">✕</button>
+  </div>
+  <div class="drawer-body" id="drawerBody"></div>
+</div>
+
+<!-- ============ 通用模态框 ============ -->
+<div id="modalOverlay" class="overlay hidden">
+  <div class="modal" id="modalBox">
+    <div class="modal-head">
+      <div class="modal-title" id="modalTitle"></div>
+      <button class="modal-x" onclick="closeModal()">✕</button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-foot" id="modalFoot"></div>
+  </div>
+</div>
+
+<div id="toastHost"></div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const TOKEN_KEY = "vgs_token";
+let TOKEN = localStorage.getItem(TOKEN_KEY) || "";
+let USER = "";
+let TAB = "overview";
+let SERVERS = [];   // 最近一次服务器列表（含状态）
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const ts = (sec) => {
+  if (!sec) return "-";
+  const d = new Date(sec * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+};
+
+function toast(msg, isErr) {
+  const el = document.createElement("div");
+  el.className = "toast" + (isErr ? " err" : "");
+  el.textContent = msg;
+  $("toastHost").appendChild(el);
+  setTimeout(() => el.remove(), isErr ? 6000 : 3200);
+}
+
+async function api(path, method, body, timeoutMs) {
+  const opt = {
+    method: method || "GET",
+    headers: { "Authorization": "Bearer " + TOKEN },
+  };
+  if (body !== undefined) {
+    opt.headers["Content-Type"] = "application/json";
+    opt.body = JSON.stringify(body);
+  }
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs || 30000);
+  try {
+    const res = await fetch(path, { ...opt, signal: ctrl.signal });
+    let data = null;
+    try { data = await res.json(); } catch (_) {}
+    if (res.status === 401) {
+      TOKEN = "";
+      localStorage.removeItem(TOKEN_KEY);
+      showLogin();
+      throw new Error("未登录或会话已过期");
+    }
+    return { status: res.status, data };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/* ================= 登录 ================= */
+function showLogin() { $("loginView").classList.remove("hidden"); $("appView").classList.add("hidden"); }
+function showApp() { $("loginView").classList.add("hidden"); $("appView").classList.remove("hidden"); }
+
+async function doLogin() {
+  const r = await fetch("/api/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: $("loginUser").value, password: $("loginPass").value }),
+  });
+  const d = await r.json();
+  if (!r.ok || !d.ok) { toast(d.error || "登录失败", true); return; }
+  TOKEN = d.data.token;
+  USER = d.data.username;
+  localStorage.setItem(TOKEN_KEY, TOKEN);
+  $("userChip").textContent = "👤 " + USER;
+  showApp();
+  switchTab(TAB);
+}
+function doLogout() {
+  TOKEN = "";
+  localStorage.removeItem(TOKEN_KEY);
+  showLogin();
+}
+$("loginPass").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
+
+/* ================= 页签 ================= */
+const TABS = [
+  ["overview", "概览"],
+  ["servers", "服务器"],
+  ["driver", "驱动升级"],
+  ["services", "模型服务"],
+  ["settings", "设置"],
+  ["audit", "日志"],
+];
+function renderTabs() {
+  $("tabbar").innerHTML = TABS.map(([k, n]) =>
+    `<button class="tab ${TAB === k ? "active" : ""}" onclick="switchTab('${k}')">${n}</button>`).join("");
+}
+async function switchTab(k) {
+  TAB = k;
+  renderTabs();
+  document.querySelectorAll("section[id^=page-]").forEach((s) => s.classList.add("hidden"));
+  $("page-" + k).classList.remove("hidden");
+  if (k === "overview") loadOverview();
+  if (k === "servers") loadServers();
+  if (k === "driver") loadDriverMatrix();
+  if (k === "services") loadServices();
+  if (k === "settings") loadSettings();
+  if (k === "audit") loadAudit();
+}
+
+/* ================= 概览 ================= */
+function statCard(k, v, s) {
+  return `<div class="card stat"><div class="stat-k">${k}</div><div class="stat-v">${v}</div><div class="stat-s">${s || ""}</div></div>`;
+}
+
+async function loadOverview() {
+  try {
+    const [sum, srv] = await Promise.all([api("/api/summary"), api("/api/servers")]);
+    if (srv.data) SERVERS = srv.data.data;
+    const d = sum.data.data || {};
+    $("statCards").innerHTML =
+      statCard("在线服务器", `${d.server_online ?? 0} / ${d.server_total ?? 0}`) +
+      statCard("GPU 总数", d.gpu_total ?? 0, `忙碌 ${d.gpu_busy ?? 0} 张`) +
+      statCard("显存", `${(d.vram_used_gb ?? 0).toFixed(0)} / ${(d.vram_total_gb ?? 0).toFixed(0)} GB`) +
+      statCard("模型服务", `${d.service_running ?? 0} / ${d.service_total ?? 0}`, "运行中 / 已注册") +
+      statCard("内存", `${d.ram_used_gb ?? 0} / ${d.ram_total_gb ?? 0} GB`) +
+      statCard("磁盘", `${(d.disk_used_gb ?? 0).toFixed(0)} / ${(d.disk_total_gb ?? 0).toFixed(0)} GB`) +
+      statCard("LLM", "dsh headless", "驱动研判 / 迁移规划") +
+      statCard("管理端口", "8900", "Pingora 网关");
+    // 驱动分布
+    const dist = {};
+    for (const s of SERVERS) {
+      const k = s.driver_version || "未知";
+      dist[k] = (dist[k] || 0) + 1;
+    }
+    $("driverDist").innerHTML = Object.entries(dist)
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([v, n]) => `<span class="chip" onclick='prefillDriver("${esc(v)}")'>${esc(v)} · ${n} 台</span>`).join("") ||
+      '<span class="cell-sub">尚无数据，请先全量刷新</span>';
+    // 简表
+    $("ovRows").innerHTML = SERVERS.map((s) =>
+      `<tr style="cursor:pointer" onclick="openDrawer(${s.id})">
+        <td><div class="cell-main">${esc(s.name)}</div><div class="cell-sub mono">${esc(s.host)}</div></td>
+        <td>${gpuCell(s)}</td>
+        <td class="mono">${s.vram_used_gb ? s.vram_used_gb.toFixed(1) + " / " + s.vram_total_gb.toFixed(0) : "-"} GB</td>
+        <td><div class="mono">${esc(s.driver_version || "-")}</div><div class="cell-sub mono">CUDA ${esc(s.cuda_version || "-")}</div></td>
+        <td class="mono">${s.ram_total_gb ? s.ram_used_gb + " / " + s.ram_total_gb + " GB" : "-"}</td>
+        <td class="mono">${s.disk_total_gb ? Math.round(s.disk_used_gb) + " / " + Math.round(s.disk_total_gb) + " GB" : "-"}</td>
+        <td>${statusBadge(s)}</td>
+      </tr>`).join("") || '<tr><td colspan="7" class="empty">暂无服务器，请先在「服务器」页添加</td></tr>';
+  } catch (e) { toast(e.message, true); }
+}
+
+function gpuCell(s) {
+  if (!s.online || !s.gpus || !s.gpus.length) return "-";
+  const busy = s.gpus.filter((g) => g.util_pct > 0 || g.used_mib > 512).length;
+  return `<span class="mono">${busy}/${s.gpu_count} 忙</span><div class="cell-sub mono">峰值 ${s.gpu_util_max ?? 0}%</div>`;
+}
+function statusBadge(s) {
+  if (!s.enabled) return '<span class="badge badge-muted">已禁用</span>';
+  if (s.online) return '<span class="badge badge-on">在线</span>';
+  return `<span class="badge badge-err" title="${esc(s.error)}">离线</span>`;
+}
+
+async function prefillDriver(v) {
+  $("drvTarget").value = v;
+  switchTab("driver");
+}
+
+/* ================= 全量刷新 ================= */
+async function refreshAll() {
+  const btn = $("btnRefreshAll");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> 采集中…';
+  try {
+    const r = await api("/api/servers/refresh-all", "POST", {}, 600000);
+    const d = r.data && r.data.data;
+    if (r.ok200(r) || (r.data && r.data.ok)) {
+      toast(`采集完成：在线 ${d.ok_n} 台，异常 ${d.failed.length} 台`);
+    } else {
+      toast((r.data && r.data.error) || "刷新失败", true);
+    }
+    if (TAB === "overview") loadOverview();
+    if (TAB === "servers") loadServers();
+  } catch (e) { toast(e.message, true); }
+  btn.disabled = false;
+  btn.textContent = "⟳ 全量刷新";
+}
+
+/* ================= 服务器 ================= */
+async function loadServers() {
+  try {
+    const r = await api("/api/servers");
+    SERVERS = r.data.data;
+    $("serverRows").innerHTML = SERVERS.map((s) =>
+      `<tr style="cursor:pointer" onclick="openDrawer(${s.id})">
+        <td><div class="cell-main">${esc(s.name)}</div><div class="cell-sub">${esc(s.notes || "")}</div></td>
+        <td class="mono">${esc(s.host)}<div class="cell-sub">:${s.port} · ${esc(s.user)}</div></td>
+        <td>${gpuCell(s)}</td>
+        <td class="mono">${s.vram_used_gb ? s.vram_used_gb.toFixed(1) + " / " + s.vram_total_gb.toFixed(0) : "-"}</td>
+        <td><div class="mono">${esc(s.driver_version || "-")}</div><div class="cell-sub mono">CUDA ${esc(s.cuda_version || "-")}</div></td>
+        <td class="mono">${s.ram_total_gb ? s.ram_used_gb + " / " + s.ram_total_gb : "-"}</td>
+        <td class="mono">${s.disk_total_gb ? Math.round(s.disk_used_gb) + " / " + Math.round(s.disk_total_gb) : "-"}</td>
+        <td>${statusBadge(s)}</td>
+        <td><div class="actions" onclick="event.stopPropagation()">
+          <button class="btn btn-ghost btn-xs" onclick="testServer(${s.id})">测试</button>
+          <button class="btn btn-ghost btn-xs" onclick="refreshOne(${s.id})">刷新</button>
+          <button class="btn btn-ghost btn-xs" onclick="openServerModal(${s.id})">编辑</button>
+          <button class="btn btn-danger btn-xs" onclick="deleteServer(${s.id})">删除</button>
+        </div></td>
+      </tr>`).join("") || '<tr><td colspan="9" class="empty">暂无服务器</td></tr>';
+  } catch (e) { toast(e.message, true); }
+}
+
+async function testServer(id) {
+  toast("SSH 连通性测试中…");
+  const r = await api(`/api/servers/${id}/test`, "POST", {}, 60000);
+  if (r.data && r.data.ok) {
+    openModal("SSH 测试成功", `<pre class="block">${esc(r.data.data.detail)}</pre>`, [["关闭", "closeModal()"]]);
+  } else {
+    toast(r.data && r.data.error || "测试失败", true);
+  }
+}
+
+async function refreshOne(id) {
+  toast("正在采集…");
+  const r = await api(`/api/servers/${id}/refresh`, "POST", {}, 120000);
+  if (r.data && r.data.ok) {
+    toast("采集完成");
+    loadServers();
+  } else toast(r.data && r.data.error || "采集失败", true);
+}
+
+async function deleteServer(id) {
+  const s = SERVERS.find((x) => x.id === id);
+  if (!confirm(`确定删除服务器 ${s ? s.name + " (" + s.host + ")" : id}？`)) return;
+  const r = await api(`/api/servers/${id}`, "DELETE");
+  if (r.data && r.data.ok) { toast("已删除"); loadServers(); }
+  else toast(r.data && r.data.error || "删除失败", true);
+}
+
+function openServerModal(id) {
+  const s = id ? SERVERS.find((x) => x.id === id) : null;
+  const body = `
+    <div class="field"><label class="label">名称</label><input class="input" id="fName" value="${esc(s ? s.name : "")}" placeholder="如 gpu-104"></div>
+    <div class="grid-2">
+      <div class="field"><label class="label">IP / Host</label><input class="input mono" id="fHost" value="${esc(s ? s.host : "")}" placeholder="如 10.0.0.10"></div>
+      <div class="field"><label class="label">SSH 端口</label><input class="input mono" id="fPort" type="number" value="${s ? s.port : 22}"></div>
+      <div class="field"><label class="label">用户名</label><input class="input mono" id="fUser" value="${esc(s ? s.user : "")}" placeholder="SSH 用户名"></div>
+      <div class="field"><label class="label">密码${id ? "（留空不改）" : ""}</label><input class="input mono" id="fPass" type="password" value="${s ? "" : ""}" placeholder="${id ? "••••" : "SSH 密码"}"></div>
+    </div>
+    <div class="field"><label class="label">备注</label><input class="input" id="fNotes" value="${esc(s ? s.notes || "" : "")}"></div>
+    <label class="check-row"><input type="checkbox" class="checkbox" id="fEnabled" ${s && !s.enabled ? "" : "checked"}> 启用（参与周期采集）</label>`;
+  openModal(id ? "编辑服务器" : "添加服务器", body, [
+    ["取消", "closeModal()"],
+    [`保存`, `saveServer(${id || "null"})`],
+  ], true);
+}
+
+async function saveServer(id) {
+  const payload = {
+    name: $("fName").value.trim(),
+    host: $("fHost").value.trim(),
+    port: +$("fPort").value || 22,
+    user: $("fUser").value.trim(),
+    password: $("fPass").value,
+    notes: $("fNotes").value.trim(),
+    enabled: $("fEnabled").checked,
+  };
+  const r = id ? await api(`/api/servers/${id}`, "PUT", payload) : await api("/api/servers", "POST", payload);
+  if (r.data && r.data.ok) { toast("已保存"); closeModal(); loadServers(); }
+  else toast(r.data && r.data.error || "保存失败", true);
+}
+
+/* ================= 抽屉 ================= */
+async function openDrawer(id) {
+  $("drawer").classList.remove("hidden");
+  $("drawerBackdrop").classList.remove("hidden");
+  $("drawerBody").innerHTML = '<div class="empty"><span class="spinner"></span> 加载中…</div>';
+  $("drawerTitle").textContent = "服务器详情";
+  const r = await api(`/api/servers/${id}`);
+  if (!r.data || !r.data.ok) { toast(r.data && r.data.error || "加载失败", true); return; }
+  const s = r.data.data;
+  $("drawerTitle").textContent = s.name;
+  $("drawerSub").textContent = `${s.host}:${s.port} · ${s.hostname || ""} ${s.os || ""}`;
+  const errBox = s.online ? "" : `<div class="badge badge-err" style="margin-bottom:14px">离线：${esc(s.error)}</div>`;
+  const kv = (k, v) => `<dt>${k}</dt><dd>${v}</dd>`;
+  let html = errBox + `
+    <dl class="kv">
+      ${kv("CPU", esc(s.cpu_model || "-") + (s.cpu_cores ? `（${s.cpu_cores} 核）` : ""))}
+      ${kv("内存", s.ram_total_gb ? `${s.ram_used_gb} / ${s.ram_total_gb} GB` : "-")}
+      ${kv("磁盘", s.disk_total_gb ? `${Math.round(s.disk_used_gb)} / ${Math.round(s.disk_total_gb)} GB` : "-")}
+      ${kv("驱动版本", `<span class="mono">${esc(s.driver_version || "-")}</span>`)}
+      ${kv("CUDA", `<span class="mono">${esc(s.cuda_version || "-")}</span>`)}
+      ${kv("工具", (s.tools || []).map((t) => `<span class="badge badge-muted" style="margin:1px 4px 1px 0">${esc(t)}</span>`).join("") || "-")}
+    </dl>`;
+
+  // GPU 卡片
+  html += `<div class="section-title">GPU（${s.gpus ? s.gpus.length : 0} 张）</div>`;
+  if (s.gpus && s.gpus.length) {
+    html += s.gpus.map((g) => {
+      const pct = g.total_mib ? Math.round((g.used_mib / g.total_mib) * 100) : 0;
+      const cls = g.util_pct >= 80 ? "hot" : g.util_pct >= 40 ? "warn" : "";
+      return `<div class="gpu-row">
+        <span class="mono">GPU ${g.idx}<div class="cell-sub">${esc(g.name || "").replace("NVIDIA ", "")}</div></span>
+        <span><div class="bar"><i class="${cls}" style="width:${Math.max(2, g.util_pct)}%"></i></div>
+        <div class="cell-sub mono">${g.util_pct}% util · ${g.temp_c}°C · ${g.power_w}W</div></span>
+        <span class="mono">${(g.used_mib / 1024).toFixed(1)} / ${(g.total_mib / 1024).toFixed(0)} GB</span>
+        <span class="mono">${pct}% 显存</span>
+      </div>`;
+    }).join("");
+  } else html += '<div class="empty" style="padding:16px 0">无 GPU 数据</div>';
+
+  // 进程
+  html += `<div class="section-title">GPU 进程（${s.procs ? s.procs.length : 0}）</div>`;
+  if (s.procs && s.procs.length) {
+    html += `<table><thead><tr><th>PID</th><th>进程</th><th>GPU</th><th>显存</th></tr></thead><tbody>` +
+      s.procs.map((p) => `<tr><td class="mono">${p.pid}</td><td class="cell-main">${esc(p.name)}</td><td class="mono">${p.gpu_idx.join(",") || "-"}</td><td class="mono">${(p.mem_mib / 1024).toFixed(1)} GB</td></tr>`).join("") +
+      `</tbody></table>`;
+  } else html += '<div class="cell-sub" style="margin-bottom:8px">无 GPU 进程</div>';
+
+  // 模型目录
+  html += `<div class="section-title">模型存储目录（${s.models ? s.models.length : 0}）</div>`;
+  if (s.models && s.models.length) {
+    html += s.models.map((m) =>
+      `<div style="padding:8px 0;border-bottom:1px solid var(--muted)">
+        <div class="mono" style="font-size:12px;word-break:break-all">${esc(m.path)}</div>
+        <div class="cell-sub">${(m.size_gb || 0).toFixed(1)} GB · ${esc(m.kind || "")}${m.in_use_by && m.in_use_by.length ? ` · <span style="color:var(--warn)">使用中：${m.in_use_by.map(esc).join("、")}</span>` : ""}</div>
+      </div>`).join("");
+  } else html += '<div class="cell-sub">未发现模型目录</div>';
+
+  html += `<div class="section-title">操作</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-outline btn-sm" onclick="refreshOne(${s.id});openDrawer(${s.id})">⟳ 重新采集</button>
+      <button class="btn btn-outline btn-sm" onclick="testServer(${s.id})">SSH 测试</button>
+    </div>
+    <div class="hint" style="margin-top:14px">更新时间：${ts(s.updated_at)}</div>`;
+  $("drawerBody").innerHTML = html;
+}
+function closeDrawer() {
+  $("drawer").classList.add("hidden");
+  $("drawerBackdrop").classList.add("hidden");
+}
+
+/* ================= 驱动升级 ================= */
+async function loadDriverMatrix() {
+  try {
+    const r = await api("/api/driver-matrix");
+    const d = r.data.data;
+    if (!$("drvTarget").value) {
+      const latest = (d.distinct_drivers || []).sort().pop();
+      if (latest) $("drvTarget").value = latest;
+    }
+    $("drvMatrix").innerHTML = d.rows.map((x) =>
+      `<tr>
+        <td><div class="cell-main">${esc(x.name)}</div><div class="cell-sub mono">${esc(x.host)}</div></td>
+        <td class="mono">${esc(x.driver || "-")}</td>
+        <td class="mono">${esc(x.cuda || "-")}</td>
+        <td class="mono">${x.online ? x.gpus + " 张" : "离线"}</td>
+        <td class="mono">${x.online ? x.vram_used_gb.toFixed(1) + " GB" : "-"}</td>
+        <td>${(x.procs || []).map((p) => `<span class="badge badge-muted" style="margin:1px 3px 1px 0">${esc(p)}</span>`).join("") || "-"}</td>
+        <td>${(x.models_in_use || []).map((m) => `<div class="cell-sub mono" title="${esc(m.path)}">${esc(m.by.join(",") || "空闲")}</div>`).join("") || "-"}</td>
+      </tr>`).join("") || '<tr><td colspan="7" class="empty">无数据</td></tr>';
+  } catch (e) { toast(e.message, true); }
+}
+
+async function analyzeDriver() {
+  const target_driver = $("drvTarget").value.trim();
+  if (!target_driver) { toast("请填写目标驱动版本", true); return; }
+  const btn = $("btnAnalyze");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> AI 研判中（10–40 秒）…';
+  try {
+    const r = await api("/api/driver-matrix/analyze", "POST",
+      { target_driver, target_cuda: $("drvCuda").value.trim() }, 300000);
+    if (!r.data || !r.data.ok) { toast(r.data && r.data.error || "研判失败", true); return; }
+    const d = r.data.data;
+    $("drvResult").classList.remove("hidden");
+    $("drvResultTitle").textContent = `研判结果 · 目标 ${d.target_driver} ${d.target_cuda ? "/ CUDA " + d.target_cuda : ""}${d.note ? "（" + d.note + "）" : ""}`;
+    $("drvRows").innerHTML = d.servers.map((x) => {
+      const b = x.safe ? '<span class="badge badge-ok">可直接升级</span>' : '<span class="badge badge-warn">需先停服务</span>';
+      return `<tr>
+        <td><div class="cell-main">${esc(x.name)}</div><div class="cell-sub mono">${esc(x.host)}</div></td>
+        <td class="mono">${esc(x.current_driver || "-")}</td>
+        <td class="mono">${esc(x.current_cuda || "-")}</td>
+        <td>${b}</td>
+        <td>${(x.stop_services || []).map((p) => `<span class="badge badge-muted" style="margin:1px 3px 1px 0">${esc(p)}</span>`).join("") || "无"}</td>
+        <td>${riskBadge(x.risk)}</td>
+        <td style="max-width:340px">${esc(x.reason)}</td>
+      </tr>`;
+    }).join("");
+    toast("研判完成");
+  } catch (e) { toast(e.message, true); }
+  btn.disabled = false;
+  btn.textContent = "AI 研判升级兼容性";
+}
+function riskBadge(r) {
+  if (r === "low") return '<span class="badge badge-ok">低</span>';
+  if (r === "medium") return '<span class="badge badge-warn">中</span>';
+  if (r === "high") return '<span class="badge badge-err">高</span>';
+  return `<span class="badge badge-muted">${esc(r || "-")}</span>`;
+}
+
+/* ================= 模型服务 ================= */
+let SERVICES = [];
+async function loadServices() {
+  try {
+    const [r, srv] = await Promise.all([api("/api/services"), api("/api/servers")]);
+    SERVICES = r.data.data;
+    SERVERS = srv.data.data;
+    const srvName = (id) => (SERVERS.find((x) => x.id === id) || {}).host || "-";
+    $("serviceRows").innerHTML = SERVICES.map((s) =>
+      `<tr>
+        <td><div class="cell-main">${esc(s.name)}</div><div class="cell-sub">${esc(s.notes || "")}</div></td>
+        <td class="mono" style="word-break:break-all;max-width:260px">${esc(s.model_path)}</td>
+        <td><span class="badge badge-muted">${esc(s.deploy_type)}</span></td>
+        <td class="mono">${esc(s.server_host || srvName(s.server_id))}</td>
+        <td class="mono">${s.port}</td>
+        <td class="mono">${s.tp}</td>
+        <td>${s.status === "running" ? '<span class="badge badge-on">运行中</span>' : s.status === "migrating" ? '<span class="badge badge-warn">迁移中</span>' : s.status === "error" ? '<span class="badge badge-err">异常</span>' : '<span class="badge badge-off">已停止</span>'}</td>
+        <td><div class="actions" onclick="event.stopPropagation()">
+          <button class="btn btn-ghost btn-xs" onclick="startService(${s.id})">启动</button>
+          <button class="btn btn-ghost btn-xs" onclick="stopService(${s.id})">停止</button>
+          <button class="btn btn-ghost btn-xs" onclick="planService(${s.id})">迁移方案</button>
+          <button class="btn btn-ghost btn-xs" onclick="copyModel(${s.id})">拷贝模型</button>
+          <button class="btn btn-ghost btn-xs" onclick="openServiceModal(${s.id})">编辑</button>
+          <button class="btn btn-danger btn-xs" onclick="deleteService(${s.id})">删除</button>
+        </div></td>
+      </tr>`).join("") || '<tr><td colspan="8" class="empty">暂无模型服务</td></tr>';
+  } catch (e) { toast(e.message, true); }
+}
+
+function serverOptions(selected, excludeId) {
+  return SERVERS.filter((s) => s.enabled && s.id !== excludeId).map((s) =>
+    `<option value="${s.id}" ${s.id === selected ? "selected" : ""}>${esc(s.name)}（${esc(s.host)}）</option>`).join("");
+}
+
+function openServiceModal(id) {
+  const s = id ? SERVICES.find((x) => x.id === id) : null;
+  const body = `
+    <div class="grid-2">
+      <div class="field"><label class="label">服务名称</label><input class="input" id="fSvcName" value="${esc(s ? s.name : "")}"></div>
+      <div class="field"><label class="label">部署方式</label>
+        <select class="select" id="fSvcType">
+          ${["vllm", "sglang", "docker", "python"].map((t) => `<option value="${t}" ${s && s.deploy_type === t ? "selected" : !s && t === "vllm" ? "selected" : ""}>${t}</option>`).join("")}
+        </select>
+      </div>
+    </div>
+    <div class="field"><label class="label">模型路径（服务器上的绝对路径）</label><input class="input mono" id="fSvcModel" value="${esc(s ? s.model_path : "")}" placeholder="/data/models/Qwen2.5-7B-Instruct"></div>
+    <div class="grid-2">
+      <div class="field"><label class="label">所在机器</label><select class="select" id="fSvcServer">${serverOptions(s ? s.server_id : null)}</select></div>
+      <div class="field"><label class="label">端口</label><input class="input mono" id="fSvcPort" type="number" value="${s ? s.port : 8000}"></div>
+      <div class="field"><label class="label">Tensor Parallel（卡数）</label><input class="input mono" id="fSvcTp" type="number" value="${s ? s.tp : 1}"></div>
+      <div class="field"><label class="label">停止匹配模式（pkill -f，可选）</label><input class="input mono" id="fSvcStop" value="${esc(s ? s.stop_pattern || "" : "")}" placeholder="vllm serve ${esc(s ? s.name : "MODEL")}"></div>
+    </div>
+    <div id="fDockerWrap" class="${s && s.deploy_type === "docker" ? "" : "hidden"}">
+      <div class="grid-2">
+        <div class="field"><label class="label">Docker 镜像</label><input class="input mono" id="fSvcDockerImage" value="${esc(s ? s.docker_image : "vllm/vllm-openai:latest")}"></div>
+        <div class="field"><label class="label">Docker 额外参数</label><input class="input mono" id="fSvcDockerArgs" value="${esc(s ? s.docker_args : "")}"></div>
+      </div>
+    </div>
+    <div id="fPythonWrap" class="${s && s.deploy_type === "python" ? "" : "hidden"}">
+      <div class="field"><label class="label">Python 启动命令模板（{model} {port} {gpus} 会被替换）</label><textarea class="textarea mono" id="fSvcPyCmd" rows="2">${esc(s ? s.python_cmd : "python3 -m my_server --model {model} --port {port}")}</textarea></div>
+    </div>
+    <div class="field"><label class="label">额外启动参数（vllm/sglang）</label><input class="input mono" id="fSvcExtra" value="${esc(s ? s.extra_args : "")}" placeholder="--max-model-len 8192 --gpu-memory-utilization 0.9"></div>
+    <div class="field"><label class="label">备注</label><input class="input" id="fSvcNotes" value="${esc(s ? s.notes || "" : "")}"></div>`;
+  openModal(id ? "编辑模型服务" : "注册模型服务", body, [
+    ["取消", "closeModal()"],
+    [`保存`, `saveService(${id || "null"})`],
+  ], true);
+  const syncWrap = () => {
+    const t = $("fSvcType").value;
+    $("fDockerWrap").classList.toggle("hidden", t !== "docker");
+    $("fPythonWrap").classList.toggle("hidden", t !== "python");
+  };
+  $("fSvcType").addEventListener("change", syncWrap);
+}
+
+async function saveService(id) {
+  const payload = {
+    name: $("fSvcName").value.trim(),
+    deploy_type: $("fSvcType").value,
+    model_path: $("fSvcModel").value.trim(),
+    server_id: +$("fSvcServer").value || 0,
+    port: +$("fSvcPort").value || 8000,
+    tp: +$("fSvcTp").value || 1,
+    stop_pattern: $("fSvcStop").value.trim(),
+    docker_image: $("fSvcDockerImage").value.trim(),
+    docker_args: $("fSvcDockerArgs").value.trim(),
+    python_cmd: $("fSvcPyCmd").value.trim(),
+    extra_args: $("fSvcExtra").value.trim(),
+    notes: $("fSvcNotes").value.trim(),
+  };
+  const r = id ? await api(`/api/services/${id}`, "PUT", payload) : await api("/api/services", "POST", payload);
+  if (r.data && r.data.ok) { toast("已保存"); closeModal(); loadServices(); }
+  else toast(r.data && r.data.error || "保存失败", true);
+}
+
+// ---------- 智能检测 ----------
+let DISCOVERED = [];
+
+async function runDiscover() {
+  const btn = $("btnDiscover");
+  btn.disabled = true; btn.textContent = "⏳ 检测中…";
+  openModal("智能检测 — 机群真实运行的模型服务",
+    `<div class="muted" style="padding:24px;text-align:center">正在 SSH 深扫所有启用机器（完整进程 cmdline + 容器 + 模型目录）…<br>约需 30–90 秒，请耐心等待</div>`, []);
+  const { status, data } = await api("/api/discover", "POST", {}, 300000);
+  if (status !== 200) {
+    btn.disabled = false; btn.textContent = "🔍 智能检测";
+    toast("检测失败: " + (data.error || status), true);
+    return;
+  }
+  DISCOVERED = (data.data && data.data.items) || [];
+  const failed = (data.data && data.data.failed) || [];
+  renderDiscover(failed);
+  btn.disabled = false; btn.textContent = "🔍 智能检测";
+}
+
+function renderDiscover(failed) {
+  failed = failed || [];
+  let html = `<div class="muted" style="margin-bottom:8px">共检测到 <b>${DISCOVERED.length}</b> 个运行中的服务${failed.length ? `，<span style="color:var(--red)">${failed.length} 台机器检测失败</span>` : ""}</div>`;
+  if (!DISCOVERED.length) {
+    html += `<div class="muted" style="padding:24px;text-align:center">所有启用机器上未发现 GPU 计算进程</div>`;
+  } else {
+    html += `<div style="overflow-x:auto"><table><thead><tr>
+      <th>机器</th><th>引擎</th><th>模型路径 / 大小</th><th>进程 (pid)</th><th>GPU</th><th>显存</th><th>端口</th><th>驱动/CUDA</th><th>容器</th><th></th>
+    </tr></thead><tbody>`;
+    DISCOVERED.forEach((it, i) => {
+      const sizeTag = it.model_size_gb ? ` <span class="muted">(${it.model_size_gb.toFixed(1)}GB${it.model_kind ? ", " + esc(it.model_kind) : ""})</span>` : "";
+      const model = it.model_path
+        ? esc(it.model_path) + sizeTag
+        : it.model_name
+          ? `<b>${esc(it.model_name)}</b><span class="muted">（未定位路径）</span>`
+          : '<span class="muted">未识别</span>';
+      const cmd = it.cmdline
+        ? `<span class="mono" title="${esc(it.cmdline)}" style="cursor:help">${esc(it.cmdline.length > 90 ? it.cmdline.slice(0, 90) + "…" : it.cmdline)}</span>`
+        : '<span class="muted">-</span>';
+      const drv = [it.driver_version, it.cuda_version].filter(Boolean).join(" / ");
+      const box = it.container_name ? esc(it.container_name) : "";
+      html += `<tr>
+        <td>${esc(it.server_name)}<div class="muted mono" style="font-size:11px">${esc(it.host)}</div></td>
+        <td><b>${esc(it.engine)}</b></td>
+        <td class="mono" style="font-size:12px">${model}</td>
+        <td style="max-width:260px"><div class="mono" style="font-size:11px">${cmd}</div><div class="muted">${esc(it.proc_name)} · pid ${it.pid}${it.tp ? ` · TP${it.tp}` : ""}</div></td>
+        <td>${it.gpus.length ? it.gpus.join(", ") : "-"}</td>
+        <td>${it.mem_mib ? (it.mem_mib / 1024).toFixed(1) + " GB" : "-"}</td>
+        <td>${it.port || "-"}</td>
+        <td class="mono" style="font-size:11px">${esc(drv) || "-"}</td>
+        <td class="mono" style="font-size:11px">${box || "-"}</td>
+        <td style="white-space:nowrap">${it.registered
+          ? '<span class="badge badge-green">已注册</span>'
+          : `<button class="btn btn-primary btn-sm" onclick="adoptDiscover(${i})">注册</button>`}</td>
+      </tr>`;
+    });
+    html += "</tbody></table></div>";
+  }
+  $("modalBody").innerHTML = html;
+  const unreg = DISCOVERED.filter((x) => !x.registered).length;
+  $("modalFoot").innerHTML = unreg
+    ? `<button class="btn" onclick="closeModal()">关闭</button>
+       <button class="btn btn-primary" onclick="adoptAll()">⚡ 全部注册 (${unreg})</button>`
+    : `<button class="btn" onclick="closeModal()">关闭</button>`;
+}
+
+function adoptPayload(it) {
+  return {
+    server_id: it.server_id,
+    name: it.model_name || undefined,
+    model_path: it.model_path || "",
+    engine: it.engine,
+    pid: it.pid,
+    port: it.port || undefined,
+    tp: it.tp || undefined,
+    extra_args: it.extra_args || "",
+    cmdline: it.cmdline || "",
+  };
+}
+
+async function adoptDiscover(i) {
+  const it = DISCOVERED[i];
+  const { status, data } = await api("/api/discover/adopt", "POST", adoptPayload(it), 30000);
+  if (status === 200) {
+    it.registered = true;
+    toast(`已注册「${data.data.name}」`);
+    renderDiscover();
+    loadServices();
+  } else {
+    toast("注册失败: " + (data.error || status), true);
+  }
+}
+
+async function adoptAll() {
+  const btns = document.querySelectorAll("#modalFoot .btn-primary");
+  btns.forEach((b) => { b.disabled = true; b.textContent = "⏳ 注册中…"; });
+  let okN = 0, failN = 0;
+  for (let i = 0; i < DISCOVERED.length; i++) {
+    const it = DISCOVERED[i];
+    if (it.registered) continue;
+    const { status, data } = await api("/api/discover/adopt", "POST", adoptPayload(it), 30000);
+    if (status === 200) { it.registered = true; okN++; }
+    else failN++;
+  }
+  toast(`批量注册完成：成功 ${okN}，失败 ${failN}`, failN > 0);
+  renderDiscover();
+  loadServices();
+}
+
+async function startService(id) {
+  const s = SERVICES.find((x) => x.id === id);
+  const opts = serverOptions(s ? s.server_id : null, null);
+  openModal(`启动服务：${s ? s.name : id}`,
+    `<div class="field"><label class="label">目标机器</label><select class="select" id="mStartServer">${opts}</select></div>
+     <div class="hint">将按 TP=${s ? s.tp : 1} 自动挑选空闲卡并设置 CUDA_VISIBLE_DEVICES 后台启动（nohup）。</div>`,
+    [["取消", "closeModal()"], [`启动`, `doStart(${id})`]]);
+}
+async function doStart(id) {
+  const sid = +$("mStartServer").value;
+  closeModal();
+  toast("正在目标机启动（约 30–90 秒）…");
+  const r = await api(`/api/services/${id}/start`, "POST", { server_id: sid }, 180000);
+  if (r.data && r.data.ok) {
+    toast(`已启动 pid=${r.data.data.pid || "-"} gpus=${(r.data.data.gpus || []).join(",")}`);
+    loadServices();
+  } else toast(r.data && r.data.error || "启动失败", true);
+}
+
+async function stopService(id) {
+  if (!confirm("确定停止该服务？")) return;
+  toast("停止中…");
+  const r = await api(`/api/services/${id}/stop`, "POST", {}, 60000);
+  if (r.data && r.data.ok) { toast("已停止"); loadServices(); }
+  else toast(r.data && r.data.error || "停止失败", true);
+}
+
+async function deleteService(id) {
+  if (!confirm("确定删除该服务注册？（不会停止已运行的进程）")) return;
+  const r = await api(`/api/services/${id}`, "DELETE");
+  if (r.data && r.data.ok) { toast("已删除"); loadServices(); }
+  else toast(r.data && r.data.error || "删除失败", true);
+}
+
+/* ---- 迁移方案（AI） ---- */
+async function planService(id) {
+  const s = SERVICES.find((x) => x.id === id);
+  const opts = serverOptions(null, s ? s.server_id : null);
+  openModal(`迁移方案：${s ? s.name : id}`,
+    `<div class="field"><label class="label">候选目标机器（AI 综合显存/负载/本地模型打分）</label>
+     <select class="select" id="mPlanTo"><option value="">任意（AI 选择）</option>${opts}</select></div>
+     <div class="hint">AI 规划约需 10–40 秒；失败自动回退规则引擎。</div>`,
+    [["取消", "closeModal()"], [`生成方案`, `doPlan(${id})`]]);
+}
+async function doPlan(id) {
+  const to = $("mPlanTo").value ? +$("mPlanTo").value : null;
+  closeModal();
+  toast("AI 规划中（10–40 秒）…");
+  const r = await api(`/api/services/${id}/plan`, "POST", { to_server_id: to }, 300000);
+  if (!r.data || !r.data.ok) { toast(r.data && r.data.error || "规划失败", true); return; }
+  const d = r.data.data;
+  const p = d.plan;
+  let html;
+  if (!p.target_host) {
+    html = `<div class="badge badge-err">无法确定目标机器</div><div class="hint">${esc(p.reason || "")}</div><pre class="block" style="margin-top:12px">${esc(JSON.stringify(p.raw || p, null, 2))}</pre>`;
+  } else {
+    html = `
+      <dl class="kv">
+        <dt>目标机器</dt><dd class="cell-main">${esc(p.target_name)} <span class="mono">${esc(p.target_host)}</span></dd>
+        <dt>使用 GPU</dt><dd class="mono">${(p.gpus || []).join(", ")}（CUDA_VISIBLE_DEVICES=${esc(p.cuda_visible_devices || "")}）</dd>
+        <dt>目标空闲显存</dt><dd class="mono">${(p.free_vram_gb || 0).toFixed(0)} GB</dd>
+        <dt>模型本地存在</dt><dd>${p.model_local ? "是" : "否（需先拷贝）"}</dd>
+        <dt>理由</dt><dd>${esc(p.reason || "-")}</dd>
+      </dl>
+      <div class="section-title">执行步骤</div>`;
+    (p.commands || []).forEach((c, i) => {
+      html += `<div style="padding:8px 0;border-bottom:1px solid var(--muted)"><div class="cell-main">${i + 1}. ${esc(c.step)} <span class="mono cell-sub">@ ${esc(c.host)}</span></div><div class="mono" style="font-size:12px;word-break:break-all;color:var(--muted-foreground);margin-top:4px">${esc(c.cmd)}</div></div>`;
+    });
+    html += `<div style="margin-top:14px"><button class="btn btn-primary btn-sm" onclick="closeModal();openMigrate(${id}, '${esc(p.target_host)}')">下一步：执行迁移</button></div>`;
+  }
+  openModal(`迁移方案：${d.note ? "（" + d.note + "）" : ""}`, html, [["关闭", "closeModal()"]], true);
+}
+
+/* ---- 执行迁移（蓝绿） ---- */
+let MIG_STATE = null;
+function openMigrate(id, targetHost) {
+  const s = SERVICES.find((x) => x.id === id);
+  const srv = SERVERS.find((x) => x.host === targetHost);
+  const opts = serverOptions(srv ? srv.id : null, s ? s.server_id : null);
+  MIG_STATE = { id, targetHost };
+  openModal(`执行迁移：${s ? s.name : id}`,
+    `<div class="field"><label class="label">目标机器</label><select class="select" id="mMigTo" onchange="MIG_STATE.targetHost=SERVERS.find(x=>x.id==+this.value).host">${opts}</select></div>
+     <label class="check-row" style="margin-bottom:8px"><input type="checkbox" class="checkbox" id="mMigForce"> 目标机没有模型也强制启动（风险自担）</label>
+     <div class="hint">蓝绿流程：目标机启动 → 12 秒健康检查 → 通过后停止源机。若目标机缺少模型会返回 409 并给出 rsync 命令。</div>`,
+    [["取消", "closeModal()"], [`开始迁移`, `doMigrate(${id})`]]);
+}
+async function doMigrate(id) {
+  const to = +$("mMigTo").value;
+  const force = $("mMigForce").checked;
+  closeModal();
+  toast("迁移执行中（启动 + 健康检查 + 停源，约 30–90 秒）…");
+  const r = await api(`/api/services/${id}/migrate`, "POST", { to_server_id: to, force }, 300000);
+  const d = r.data || {};
+  const steps = (d.data && d.data.steps) || d.steps || [];
+  let html = `<ul class="steps">` + steps.map((st) => {
+    const b = st.status === "done" ? '<span class="badge badge-ok">完成</span>'
+      : st.status === "failed" ? '<span class="badge badge-err">失败</span>'
+      : st.status === "blocked" ? '<span class="badge badge-warn">受阻</span>'
+      : st.status === "warning" ? '<span class="badge badge-warn">警告</span>'
+      : `<span class="badge badge-muted">${esc(st.status)}</span>`;
+    return `<li>${b}<div>${esc(st.name)}<div class="cell-sub mono" style="word-break:break-all">${esc(st.detail || "")}</div></div></li>`;
+  }).join("") + `</ul>`;
+  if (r.status === 409 || d.ok === false) {
+    html = `<div class="badge badge-err" style="margin-bottom:12px">${esc(d.error || "迁移被拦截（源服务未受影响）")}</div>` + html;
+  } else if (d.ok) {
+    html = `<div class="badge badge-ok" style="margin-bottom:12px">迁移完成 pid=${(d.data && d.data.pid) || "-"}</div>` + html;
+  }
+  openModal("迁移结果", html, [["关闭", "closeModal()"]], true);
+  loadServices();
+}
+
+/* ---- 模型拷贝 ---- */
+function copyModel(id) {
+  const s = SERVICES.find((x) => x.id === id);
+  const opts = serverOptions(null, s ? s.server_id : null);
+  openModal(`拷贝模型：${s ? s.name : id}`,
+    `<div class="field"><label class="label">目标机器</label><select class="select" id="mCopyTo">${opts}</select></div>
+     <div class="hint">将在源机后台执行 rsync（nohup），不阻塞页面；随后可用「拷贝状态」查看各机是否已有该模型。</div>`,
+    [["取消", "closeModal()"], [`开始拷贝`, `doCopy(${id})`]]);
+}
+async function doCopy(id) {
+  const to = +$("mCopyTo").value;
+  closeModal();
+  const r = await api(`/api/services/${id}/copy`, "POST", { to_server_id: to }, 60000);
+  if (r.data && r.data.ok) {
+    toast("rsync 已后台启动：" + (r.data.data.log || ""));
+  } else toast(r.data && r.data.error || "启动拷贝失败", true);
+}
+
+/* ================= 设置 ================= */
+async function loadSettings() {
+  try {
+    const r = await api("/api/settings");
+    const d = r.data.data;
+    $("setRefresh").value = d.refresh_interval_secs;
+    $("setSshTimeout").value = d.ssh_timeout_secs;
+    $("setConc").value = d.ssh_concurrency;
+    $("setLlmCmd").value = d.llm.command;
+    $("setLlmProfile").value = d.llm.profile;
+    $("setLlmTimeout").value = d.llm.timeout_secs;
+    $("setLlmEnabled").checked = !!d.llm.enabled;
+  } catch (e) { toast(e.message, true); }
+}
+async function saveSettings() {
+  const payload = {
+    refresh_interval_secs: +$("setRefresh").value,
+    ssh_timeout_secs: +$("setSshTimeout").value,
+    ssh_concurrency: +$("setConc").value,
+    llm: {
+      enabled: $("setLlmEnabled").checked,
+      command: $("setLlmCmd").value,
+      profile: $("setLlmProfile").value,
+      timeout_secs: +$("setLlmTimeout").value,
+    },
+  };
+  const r = await api("/api/settings", "PUT", payload);
+  if (r.data && r.data.ok) toast("设置已保存并热生效");
+  else toast(r.data && r.data.error || "保存失败", true);
+}
+
+/* ================= 日志 ================= */
+async function loadAudit() {
+  try {
+    const r = await api("/api/audit?limit=300");
+    const rows = r.data.data || [];
+    $("auditRows").innerHTML = rows.map((a) =>
+      `<tr>
+        <td class="mono">${ts(a.at)}</td>
+        <td>${esc(a.user)}</td>
+        <td><span class="badge badge-muted">${esc(a.action)}</span></td>
+        <td class="mono" style="word-break:break-all">${esc(a.target)}</td>
+        <td class="cell-sub" style="max-width:420px;word-break:break-all">${esc(a.detail || "")}</td>
+        <td class="mono">${esc(a.ip)}</td>
+      </tr>`).join("") || '<tr><td colspan="6" class="empty">暂无日志</td></tr>';
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ================= 模态框 ================= */
+function openModal(title, bodyHtml, footBtns, wide) {
+  $("modalTitle").textContent = title;
+  $("modalBody").innerHTML = bodyHtml;
+  $("modalFoot").innerHTML = (footBtns || []).map((b, i) =>
+    i === footBtns.length - 1
+      ? `<button class="btn btn-primary" onclick="${b[1]}">${b[0]}</button>`
+      : `<button class="btn btn-outline" onclick="${b[1]}">${b[0]}</button>`).join("");
+  $("modalBox").classList.toggle("modal-wide", !!wide);
+  $("modalOverlay").classList.remove("hidden");
+}
+function closeModal() { $("modalOverlay").classList.add("hidden"); }
+$("modalOverlay").addEventListener("mousedown", (e) => { if (e.target === $("modalOverlay")) closeModal(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeModal(); closeDrawer(); } });
+
+/* ================= 启动 ================= */
+renderTabs();
+if (TOKEN) {
+  api("/api/me").then((r) => {
+    if (r.data && r.data.ok) {
+      USER = r.data.data.username;
+      $("userChip").textContent = "👤 " + USER;
+      showApp();
+      switchTab(TAB);
+    } else showLogin();
+  }).catch(() => showLogin());
+} else showLogin();
+</script>
+</body>
+</html>
