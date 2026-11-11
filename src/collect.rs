@@ -81,7 +81,8 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   printf '%s\n' "$apps" | while IFS='|' read -r pid name gi mem; do
     [ -n "$pid" ] || continue
     cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-256 | tr '|' '/')
-    printf '%s|%s|%s|%s|%s\n' "$pid" "$name" "$gi" "$mem" "$cmd"
+    pp=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' \t\n')
+    printf '%s|%s|%s|%s|%s|%s\n' "$pid" "$name" "$gi" "$mem" "$cmd" "$pp"
   done
 fi
 echo "@@MODELS@@"
@@ -237,7 +238,7 @@ fn parse_gpu_line(line: &str) -> Option<GpuStat> {
 }
 
 fn parse_app_line(line: &str) -> Option<ProcStat> {
-    let mut it = line.splitn(5, '|');
+    let mut it = line.splitn(6, '|');
     let pid = it.next()?.trim().parse().ok()?;
     let name = it.next()?.trim().to_string();
     let gpus = it
@@ -248,7 +249,8 @@ fn parse_app_line(line: &str) -> Option<ProcStat> {
         .collect();
     let mem_mib = it.next()?.trim().parse().ok()?;
     let cmdline = it.next().unwrap_or("").to_string();
-    Some(ProcStat { pid, name, gpu_idx: gpus, mem_mib, cmdline })
+    let ppid = it.next().map(|s| s.trim().parse().unwrap_or(0)).unwrap_or(0);
+    Some(ProcStat { pid, name, gpu_idx: gpus, mem_mib, cmdline, ppid })
 }
 
 fn parse_u32(s: &str) -> u32 {

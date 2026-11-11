@@ -16,6 +16,10 @@ use crate::ssh::ssh_exec;
 /// P 行格式：`P|pid|name|gi|mem|cid|ppid|cmd|pcmd|rootcmd|rootpid`
 /// （cmd / pcmd / rootcmd 内的 '|' 已在 shell 侧替换为 '/'；rootcmd = 祖先链上最近的真实业务命令，rootpid 为其 pid）。
 const DISCOVER_SCRIPT: &str = r#"
+# 端口归属探测：普通用户对 root 进程看不到 ss -p 的 pid 映射；
+# 若该机可用免密 sudo 则升级探测权限（无 sudo 环境自动回退）
+SSBIN=ss
+if command -v sudo >/dev/null 2>&1 && sudo -n ss -tlnH >/dev/null 2>&1; then SSBIN="sudo -n ss"; fi
 echo "@@PROCDEEP@@"
 if command -v nvidia-smi >/dev/null 2>&1; then
   gpm=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>/dev/null | awk -F',' '{u=$2;gsub(/^[ \t]+|[ \t]+$/,"",u);print toupper(u)" "$1}')
@@ -66,7 +70,7 @@ ps -eo pid=,comm=,rss= 2>/dev/null | while read -r rpid rcomm rmem; do
   case "$rcomm" in
     sglang::router|sgl_router|sglang-router|sgl-router)
       rcmd=$(tr '\0' ' ' < "/proc/$rpid/cmdline" 2>/dev/null | sed 's/|/\//g' | cut -c1-512)
-      rports=$(ss -tlnpH 2>/dev/null | awk -v p="pid=$rpid," 'index($0,p){a=$4;sub(/.*:/,"",a);print a}' | sort -nu | head -3 | paste -sd, -)
+      rports=$($SSBIN -tlnpH 2>/dev/null | awk -v p="pid=$rpid," 'index($0,p){a=$4;sub(/.*:/,"",a);print a}' | sort -nu | head -3 | paste -sd, -)
       rcid=""; cur=$(ps -o ppid= -p "$rpid" 2>/dev/null | tr -d ' \t\n'); depth=0
       while [ -n "$cur" ] && [ "$cur" != "1" ] && [ "$depth" -lt 6 ]; do
         acmd=$(tr '\0' ' ' < "/proc/$cur/cmdline" 2>/dev/null | sed 's/|/\//g' | cut -c1-512)
@@ -624,12 +628,18 @@ pub fn detect(
             }
         }
     }
-    // 2) 同机 cmdline 完全相同的非 worker 进程 → 同一服务的多 worker（如 paddlex 双卡）
+    // 2) 同机 cmdline 完全相同的非 worker 进程 → 同一服务的多 worker（如 paddlex 双卡）。
+    //    例外：分属不同容器的进程视为独立实例（如两容器各跑一个同模型 sglang，
+    //    内部 --port 相同、仅宿主映射端口不同），不得跨容器合并。
     for i in 0..procs.len() {
         for j in (i + 1)..procs.len() {
             let (a, b) = (&procs[i], &procs[j]);
             if !is_worker_proc(a) && !is_worker_proc(b) && !a.cmdline.is_empty() && a.cmdline == b.cmdline {
-                uf.union(&key(a.pid), &key(b.pid));
+                let same_container =
+                    (a.cid.is_empty() && b.cid.is_empty()) || (!a.cid.is_empty() && a.cid == b.cid);
+                if same_container {
+                    uf.union(&key(a.pid), &key(b.pid));
+                }
             }
         }
     }
@@ -806,9 +816,11 @@ pub fn detect(
             .map(|c| (c.name.clone(), c.image.clone(), c.ports.clone()))
             .unwrap_or_default();
 
-        // 进程命令行里没有 --port 时（sglang 默认端口等），回退到容器发布端口
-        if port == 0 {
-            port = cports.first().copied().unwrap_or(0);
+        // 端口：优先取容器宿主侧发布端口（用户实际访问的端口）——
+        // 多实例部署时容器内 --port 相同、只有宿主映射端口能区分；
+        // flag 端口不在发布列表中（或 flag 缺失=0）时回退到容器第一个发布端口
+        if !cports.is_empty() && !cports.contains(&port) {
+            port = cports[0];
         }
 
         let mut model_name = String::new();

@@ -29,6 +29,7 @@
 //!   GET  /api/settings          全局设置
 //!   PUT  /api/settings          更新全局设置
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,6 +83,8 @@ pub struct ServicePayload {
     pub server_id: Option<u64>,
     pub stop_pattern: Option<String>,
     pub notes: Option<String>,
+    /// 纳管的外部容器名（docker 方式启停时按容器名精确 stop，避免误杀同机同模型实例）
+    pub container_name: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -747,21 +750,7 @@ async fn routes_driver_matrix(
                 .iter()
                 .filter(|sv| sv.server_id == s.id)
                 .collect();
-            let unmanaged = st
-                .map(|x| {
-                    x.procs
-                        .iter()
-                        .filter(|p| {
-                            !server_services.iter().any(|sv| {
-                                (!sv.model_path.is_empty() && p.cmdline.contains(&sv.model_path))
-                                    || (!sv.stop_pattern.trim().is_empty()
-                                        && p.cmdline.contains(sv.stop_pattern.trim()))
-                                    || sv.pid.map(|pid| pid == p.pid).unwrap_or(false)
-                            })
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
+            let unmanaged = st.map(|x| count_unmanaged_gpu_procs(&server_services, x)).unwrap_or(0);
             json!({
                 "id": s.id,
                 "name": s.name,
@@ -1127,18 +1116,47 @@ fn cmp_driver_ver(a: &str, b: &str) -> std::cmp::Ordering {
     ver3(a).cmp(&ver3(b))
 }
 
-/// 统计机器上未纳管的 GPU 进程数（进程名/cmdline/pid 均不匹配任一注册服务）。
+/// 判定单个 GPU 进程是否被注册服务纳管（含祖先链）。
+/// sglang 等引擎会改写子进程标题（sglang::scheduler_TPx 等），其 cmdline 不再包含
+/// 模型路径，因此沿 ppid 祖先链上溯（最多 8 跳，防环），任一祖先命中即视为纳管。
+fn proc_managed_by(svcs: &[&ServiceConf], by_pid: &HashMap<u32, &ProcStat>, p: &ProcStat) -> bool {
+    let matches = |x: &ProcStat| {
+        svcs.iter().any(|sv| {
+            (!sv.model_path.is_empty() && x.cmdline.contains(&sv.model_path))
+                || (!sv.stop_pattern.trim().is_empty()
+                    && x.cmdline.contains(sv.stop_pattern.trim()))
+                || sv.pid.map(|pid| pid == x.pid).unwrap_or(false)
+        })
+    };
+    if matches(p) {
+        return true;
+    }
+    let mut cur = p.ppid;
+    let mut hops = 0usize;
+    while cur != 0 && hops < 8 {
+        match by_pid.get(&cur) {
+            Some(ap) => {
+                if matches(ap) {
+                    return true;
+                }
+                if ap.ppid == cur {
+                    break; // 防环
+                }
+                cur = ap.ppid;
+                hops += 1;
+            }
+            None => break, // 祖先不在 GPU 进程集内 → 继续上溯已无意义
+        }
+    }
+    false
+}
+
+/// 统计机器上未纳管的 GPU 进程数（进程及祖先链均不匹配任一注册服务）。
 fn count_unmanaged_gpu_procs(svcs: &[&ServiceConf], st: &ServerStatus) -> usize {
+    let by_pid: HashMap<u32, &ProcStat> = st.procs.iter().map(|x| (x.pid, x)).collect();
     st.procs
         .iter()
-        .filter(|p| {
-            !svcs.iter().any(|sv| {
-                (!sv.model_path.is_empty() && p.cmdline.contains(&sv.model_path))
-                    || (!sv.stop_pattern.trim().is_empty()
-                        && p.cmdline.contains(sv.stop_pattern.trim()))
-                    || sv.pid.map(|pid| pid == p.pid).unwrap_or(false)
-            })
-        })
+        .filter(|p| !proc_managed_by(svcs, &by_pid, p))
         .count()
 }
 
@@ -3066,6 +3084,10 @@ async fn route_service_update(
     if let Some(x) = p.stop_pattern {
         s.stop_pattern = x;
     }
+    if let Some(x) = p.container_name {
+        // 允许清空（传空串表示不再绑定容器）
+        s.container_name = x;
+    }
     if let Some(x) = p.notes {
         s.notes = x;
     }
@@ -4000,6 +4022,10 @@ async fn route_discover_adopt(
                 || s.model_path.starts_with(&model_path)
                 || model_path.starts_with(&s.model_path))
         {
+            // 两边都绑定容器且容器名不同 → 独立实例，允许分别纳管
+            if !s_cname.is_empty() && !det_cname.is_empty() && s_cname != det_cname {
+                return false;
+            }
             // 同模型：仅当端口相同（或任一侧未知=0）才视为同一服务
             match (det_port, s.port) {
                 (a, b) if a != 0 && b != 0 => a == b,

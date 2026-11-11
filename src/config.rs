@@ -383,6 +383,10 @@ pub struct ProcStat {
     pub mem_mib: u32,
     #[serde(default)]
     pub cmdline: String,
+    /// 父进程 pid（0=未知）。用于判定 sglang::scheduler 等改写过进程标题的子进程
+    /// 是否归属某注册服务（沿祖先链上溯匹配）。
+    #[serde(default)]
+    pub ppid: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

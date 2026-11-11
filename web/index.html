@@ -1310,6 +1310,7 @@ function openServiceModal(id) {
       <div class="field"><label class="label">Tensor Parallel（卡数）</label><input class="input mono" id="fSvcTp" type="number" value="${s ? s.tp : 1}"></div>
       <div class="field"><label class="label">停止匹配模式（pkill -f，可选）</label><input class="input mono" id="fSvcStop" value="${esc(s ? s.stop_pattern || "" : "")}" placeholder="vllm serve ${esc(s ? s.name : "MODEL")}"></div>
     </div>
+    <div class="field"><label class="label">Docker 容器名（容器化运行时填写，按容器名精确启停，避免误杀同机同模型的其他实例）</label><input class="input mono" id="fSvcContainer" value="${esc(s ? s.container_name || "" : "")}" placeholder="qwen38-fp8-sglang"></div>
     <div id="fDockerWrap" class="${s && s.deploy_type === "docker" ? "" : "hidden"}">
       <div class="grid-2">
         <div class="field"><label class="label">Docker 镜像</label><input class="input mono" id="fSvcDockerImage" value="${esc(s ? s.docker_image : "vllm/vllm-openai:latest")}"></div>
@@ -1342,6 +1343,7 @@ async function saveService(id) {
     port: +$("fSvcPort").value || 8000,
     tp: +$("fSvcTp").value || 1,
     stop_pattern: $("fSvcStop").value.trim(),
+    container_name: $("fSvcContainer").value.trim(),
     docker_image: $("fSvcDockerImage").value.trim(),
     docker_args: $("fSvcDockerArgs").value.trim(),
     python_cmd: $("fSvcPyCmd").value.trim(),
@@ -1431,6 +1433,9 @@ function adoptPayload(it) {
     tp: it.tp || undefined,
     extra_args: it.extra_args || "",
     cmdline: it.cmdline || "",
+    container_name: it.container_name || "",
+    container_image: it.container_image || "",
+    gpus: it.gpus && it.gpus.length ? it.gpus : undefined,
   };
 }
 
