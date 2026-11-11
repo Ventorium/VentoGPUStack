@@ -332,6 +332,10 @@ pub async fn handle(session: &mut Session, state: &Arc<AppState>) {
             routes_driver_matrix(session, state, &user, &ip, &method, id_part).await
         }
         "driver-upgrades" if method == "GET" => route_drv_upgrades_list(session, state).await,
+        "router-compat" if method == "POST" => {
+            route_router_compat_check(session, state, &user, &ip).await
+        }
+        "router-compat-kb" if method == "GET" => route_router_compat_kb(session).await,
         "services" => routes_services(session, state, &user, &ip, &method, id_part, third).await,
         "discover" => {
             routes_discover(session, state, &user, &ip, &method, id_part).await
@@ -3812,6 +3816,260 @@ async fn routes_settings(
         .audit
         .record(user, "update_settings", "-", "更新全局设置", ip);
     ok(session, &json!({"saved": true})).await
+}
+
+// ---------------------------------------------------------------------------
+// sglang-router 兼容检查（知识库 + AI 分析）
+// ---------------------------------------------------------------------------
+
+/// sglang-router 版本 ↔ sglang 后端兼容知识库（官方 release 实测组合）。
+fn router_compat_kb() -> serde_json::Value {
+    json!([
+        {"router": "0.2.4", "sglang_min": "0.5.8", "sglang_max": "0.5.19", "notes": "0.2.4 于 2026-09 发布，支持 0.5.8 起的 cache_aware/power_of_two 路由；0.5.19 为当前发布验证的最高版本"},
+        {"router": "0.2.3", "sglang_min": "0.5.7", "sglang_max": "0.5.19", "notes": "支持 0.5.7 起的 OpenAI 兼容端点；旧版 balance 策略"},
+        {"router": "0.2.2", "sglang_min": "0.5.4", "sglang_max": "0.5.15", "notes": "早期 cache_aware；不识别 0.5.16+ 的 worker 心跳字段"},
+        {"router": "0.2.1", "sglang_min": "0.5.2", "sglang_max": "0.5.12", "notes": "仅 round_robin/random；0.5.13+ 的 /v1/models 字段不兼容"},
+        {"router": "0.2.0", "sglang_min": "0.5.0", "sglang_max": "0.5.8", "notes": "首版；不识别 0.5.9+ 的多模态 worker 元数据"}
+    ])
+}
+
+/// 从镜像名提取版本（lmsysorg/sglang:v0.5.19-cu129 → 0.5.19）。
+fn image_version(image: &str) -> Option<String> {
+    let tag = image.rsplit(':').next()?.trim();
+    let core = tag.split('-').next().unwrap_or(tag);
+    let core = core.strip_prefix('v').unwrap_or(core);
+    // 形如 0.5.19 的版本号
+    if core.split('.').count() >= 2 && core.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        Some(core.to_string())
+    } else {
+        None
+    }
+}
+
+fn cmp_semver(a: &str, b: &str) -> std::cmp::Ordering {
+    let pa: Vec<u32> = a.split('.').filter_map(|x| x.parse().ok()).collect();
+    let pb: Vec<u32> = b.split('.').filter_map(|x| x.parse().ok()).collect();
+    for i in 0..3 {
+        let x = pa.get(i).copied().unwrap_or(0);
+        let y = pb.get(i).copied().unwrap_or(0);
+        if x != y {
+            return x.cmp(&y);
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// GET /api/router-compat-kb  返回 router 兼容知识库（供 UI 展示/AI 兜底前预览）
+async fn route_router_compat_kb(session: &mut Session) {
+    let kb = router_compat_kb();
+    ok(session, &json!({"kb": kb})).await
+}
+
+/// POST /api/router-compat-check  检测机器上的 sglang-router 与其 sglang 后端的版本兼容。
+/// 先查本地知识库（镜像 tag 可解析时），未命中再交 AI（知识库全文 + 检测事实注入）。
+async fn route_router_compat_check(
+    session: &mut Session,
+    state: &Arc<AppState>,
+    user: &str,
+    ip: &str,
+) {
+    let v = parse_body(session).await.unwrap_or(Value::Null);
+    #[derive(serde::Deserialize, Default)]
+    struct P {
+        server_id: Option<u64>,
+    }
+    let p: P = serde_json::from_value(v).unwrap_or_default();
+    let server_id = match p.server_id {
+        Some(x) if x > 0 => x,
+        _ => return fail(session, 400, "缺少 server_id").await,
+    };
+    let servers = state.servers.load();
+    let server = servers
+        .servers
+        .iter()
+        .find(|s| s.id == server_id)
+        .cloned()
+        .filter(|s| s.enabled);
+    drop(servers);
+    let server = match server {
+        Some(s) => s,
+        None => return fail(session, 404, &format!("服务器不存在或已禁用: {server_id}")).await,
+    };
+
+    // 1) 深扫取 router 与 GPU 后端容器
+    let conf = state.main_conf();
+    let timeout = Duration::from_secs(conf.ssh_timeout_secs.max(20));
+    let dr = match discover::discover_one(&server.host, server.port, &server.user, &server.password, timeout).await {
+        Ok(x) => x,
+        Err(e) => return fail(session, 502, &format!("SSH 深扫失败: {e}")).await,
+    };
+    let routers: Vec<discover::RouterProc> = dr.routers.iter().filter(|r| !r.name.is_empty()).cloned().collect();
+    if routers.is_empty() {
+        return fail(session, 404, "该机器上未发现 sglang-router 进程").await;
+    }
+    // GPU 引擎进程 → 后端版本信息（按容器归组；P 行 64 位全量 cid 与 D 行 12 位短 id 前缀匹配）
+    let backends: Vec<serde_json::Value> = dr
+        .containers
+        .iter()
+        .filter(|c| {
+            !c.cid.is_empty()
+                && dr
+                    .procs
+                    .iter()
+                    .any(|p| !p.gpus.is_empty() && p.cid.get(..12).unwrap_or(&p.cid) == c.cid)
+        })
+        .map(|c| {
+            let rep = dr
+                .procs
+                .iter()
+                .find(|p| !p.gpus.is_empty() && p.cid.get(..12).unwrap_or(&p.cid) == c.cid);
+            let engine = rep
+                .map(|p| discover::classify(&p.name, &p.root_cmdline).to_string())
+                .unwrap_or_default();
+            let cmd = rep
+                .map(|p| p.root_cmdline.chars().take(400).collect::<String>())
+                .unwrap_or_default();
+            json!({
+                "container": c.name,
+                "image": c.image,
+                "engine": engine,
+                "cmdline": cmd,
+            })
+        })
+        .collect();
+
+    // 2) 本地知识库判定（镜像 tag 可解析时给出明确结论）
+    let mut local_verdict: Option<Value> = None;
+    let mut facts: Vec<String> = Vec::new();
+    for r in &routers {
+        let cname = if r.cid.is_empty() {
+            String::new()
+        } else {
+            dr.containers
+                .iter()
+                .find(|c| c.cid == r.cid.get(..12).unwrap_or(&r.cid))
+                .map(|c| c.name.clone())
+                .unwrap_or_default()
+        };
+        let image = if r.cid.is_empty() {
+            String::new()
+        } else {
+            dr.containers
+                .iter()
+                .find(|c| c.cid == r.cid.get(..12).unwrap_or(&r.cid))
+                .map(|c| c.image.clone())
+                .unwrap_or_default()
+        };
+        let rver = image_version(&image).unwrap_or_default();
+        facts.push(format!(
+            "router 进程 pid={} comm={} 容器={} 镜像={} 解析版本={} 监听端口={:?}",
+            r.pid, r.name, cname, image, if rver.is_empty() { "?" } else { rver.as_str() }, r.ports
+        ));
+        if !rver.is_empty() {
+            let kb = router_compat_kb();
+            if let Some(arr) = kb.as_array() {
+                for row in arr.iter().filter_map(|x| x.as_object()) {
+                    let kver = row.get("router").and_then(|x| x.as_str()).unwrap_or("");
+                    if kver == rver {
+                        let min = row.get("sglang_min").and_then(|x| x.as_str()).unwrap_or("");
+                        let max = row.get("sglang_max").and_then(|x| x.as_str()).unwrap_or("");
+                        // 后端镜像版本（同机 GPU 容器）
+                        let bvers: Vec<String> = dr
+                            .containers
+                            .iter()
+                            .filter(|c| {
+                                !c.cid.is_empty()
+                                    && dr
+                                        .procs
+                                        .iter()
+                                        .any(|p| !p.gpus.is_empty() && p.cid.get(..12).unwrap_or(&p.cid) == c.cid)
+                            })
+                            .filter_map(|c| image_version(&c.image))
+                            .collect();
+                        let mut bad: Vec<String> = Vec::new();
+                        for bv in &bvers {
+                            if !min.is_empty() && cmp_semver(bv, min) == std::cmp::Ordering::Less {
+                                bad.push(format!("{bv} < 最低 {min}"));
+                            }
+                            if !max.is_empty() && cmp_semver(bv, max) == std::cmp::Ordering::Greater {
+                                bad.push(format!("{bv} > 验证上限 {max}（未实测，风险）"));
+                            }
+                        }
+                        let compatible = bad.is_empty();
+                        local_verdict = Some(json!({
+                            "source": "knowledge_base",
+                            "compatible": compatible,
+                            "router_version": rver,
+                            "sglang_min": min,
+                            "sglang_max": max,
+                            "backend_versions": bvers,
+                            "problems": bad,
+                            "notes": row.get("notes").and_then(|x| x.as_str()).unwrap_or(""),
+                        }));
+                        break;
+                    }
+                }
+            }
+            if local_verdict.is_none() {
+                // 知识库无该 router 版本 → 交 AI 兜底
+                facts.push(format!("知识库无 router v{rver} 的记录，需要 AI 分析"));
+            }
+        }
+    }
+
+    // 3) 知识库未命中 → AI 兜底（知识库全文 + 检测事实注入）
+    let result = if let Some(lv) = local_verdict {
+        lv
+    } else {
+        let kb = router_compat_kb();
+        let prompt = format!(
+            "你是 LLM 推理网关兼容性专家。请判断下面的 sglang-router 与其 sglang 后端是否版本兼容。\n\n\
+             [已知兼容知识库]\n{kb}\n\n[本机检测事实]\n{facts}\n[后端进程 cmdline 样本]\n{backends}\n\n\
+             请输出 JSON：{{\"compatible\": true|false, \"verdict\": \"一句话结论\", \"problems\": [\"问题1\", ...], \
+             \"suggestion\": \"若需修复，给出一条具体建议（版本对齐方向）\"}}。只输出 JSON。",
+            kb = kb.to_string(),
+            facts = facts.join("\n"),
+            backends = backends
+                .iter()
+                .take(4)
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let llm = conf.llm.clone();
+        if !llm.enabled {
+            json!({
+                "source": "none",
+                "compatible": null,
+                "verdict": "知识库无该 sglang-router 版本记录，且 LLM 已禁用，无法自动判定",
+                "problems": [],
+                "suggestion": "请将 sglang-router 升级到知识库内版本，或在配置中启用 LLM 后重试"
+            })
+        } else {
+            match tokio::time::timeout(
+                Duration::from_secs(llm.timeout_secs),
+                ai::ask_json(&llm, &prompt),
+            )
+            .await
+            {
+                Ok(Ok(raw)) => {
+                    let parsed = ai::unwrap_llm_json(&raw);
+                    if parsed.get("verdict").and_then(|x| x.as_str()).is_none()
+                        && parsed.get("compatible").is_none()
+                    {
+                        return fail(session, 502, "AI 返回无法解析为兼容结论").await
+                    }
+                    parsed
+                }
+                Ok(Err(e)) => return fail(session, 502, &format!("AI 调用失败: {e}")).await,
+                Err(_) => return fail(session, 502, "AI 调用超时").await,
+            }
+        }
+    };
+    state
+        .audit
+        .record(user, "router_compat_check", &server.name, "router 兼容检查", ip);
+    ok(session, &result).await
 }
 
 // ---------------------------------------------------------------------------

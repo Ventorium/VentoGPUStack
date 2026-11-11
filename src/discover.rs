@@ -81,7 +81,13 @@ ps -eo pid=,comm=,rss= 2>/dev/null | while read -r rpid rcomm rmem; do
         fi
         cur=$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' \t\n'); depth=$((depth + 1))
       done
-      printf 'R|%s|%s|%s|%s|%s|%s\n' "$rpid" "$rcomm" "$rports" "$rmem" "$rcid" "$rcmd"
+      # 进程标题被改写（sglang::router）时 /proc cmdline 已无启动参数，
+      # 容器 Cmd+Entrypoint 是 --port 等参数的可靠来源
+      rargs=""
+      if [ -n "$rcid" ]; then
+        rargs=$(docker inspect --format '{{json .Config.Cmd}} {{json .Config.Entrypoint}}' "$rcid" 2>/dev/null | tr -d '\n' | sed 's/|/\//g' | cut -c1-1024)
+      fi
+      printf 'R|%s|%s|%s|%s|%s|%s|%s\n' "$rpid" "$rcomm" "$rports" "$rmem" "$rcid" "$rcmd" "$rargs"
       ;;
   esac
 done
@@ -137,6 +143,9 @@ pub struct RouterProc {
     /// 归属容器 id（空 = 宿主机进程）
     pub cid: String,
     pub cmdline: String,
+    /// 容器 Cmd+Entrypoint 的 JSON（进程标题被改写时，--port 等启动参数的来源）
+    #[serde(default)]
+    pub args: String,
 }
 
 /// 一台机器的深扫结果。
@@ -242,8 +251,8 @@ pub async fn discover_one(
                 let Some(rest) = l.strip_prefix("R|") else {
                     continue;
                 };
-                let parts: Vec<&str> = rest.splitn(6, '|').collect();
-                if parts.len() < 6 {
+                let parts: Vec<&str> = rest.splitn(7, '|').collect();
+                if parts.len() < 7 {
                     continue;
                 }
                 let pid: u32 = parts[0].parse().unwrap_or(0);
@@ -258,6 +267,7 @@ pub async fn discover_one(
                     mem_mib: parts[3].parse().unwrap_or(0) / 1024,
                     cid: parts[4].to_string(),
                     cmdline: parts[5].to_string(),
+                    args: parts[6].to_string(),
                 });
             }
             _ => {}
@@ -310,6 +320,19 @@ fn tokens_of(cmdline: &str) -> Vec<String> {
 
 fn base_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+/// 从容器 Cmd+Entrypoint 的 JSON 中提取 `--port` 值
+/// （进程标题被改写如 sglang::router 时，/proc cmdline 已无参数，这是主服务端口的可靠来源）。
+fn container_args_port(args: &str) -> Option<u16> {
+    let idx = args.find("--port")?;
+    let rest = &args[idx + "--port".len()..];
+    if rest.starts_with('=') {
+        let v = rest[1..].trim_start_matches('"');
+        return v.split(['"', ',', '}']).next()?.parse().ok();
+    }
+    let v = rest.trim_start_matches(',').trim_start_matches('"');
+    v.split(['"', ',', '}']).next()?.parse().ok()
 }
 
 /// 取 `--flag value` 或 `--flag=value` 形式的参数值。
@@ -849,16 +872,31 @@ pub fn detect(
             .flatten()
             .unwrap_or((0.0, String::new()));
 
+        // 已注册判定与 adopt 查重同规则：同模型不同容器属独立实例，仍可纳管
         let registered = existing.iter().any(|s| {
-            s.server_id == server.id
-                && ((!model.is_empty()
-                    && !s.model_path.is_empty()
-                    && (s.model_path == model
-                        || s.model_path.starts_with(&model)
-                        || model.starts_with(&s.model_path)))
-                    || (s.pid.is_some() && (pids_in.contains(&s.pid.unwrap()) || s.pid == Some(pid)))
-                    || (!cname.is_empty() && s.container_name == cname)
-                    || (port != 0 && s.port == port))
+            if s.server_id != server.id {
+                return false;
+            }
+            if s.pid.is_some() && (pids_in.contains(&s.pid.unwrap()) || s.pid == Some(pid)) {
+                return true;
+            }
+            let s_cname = s.container_name.trim();
+            if !s_cname.is_empty() && !cname.is_empty() {
+                return s_cname == cname; // 同容器=已注册；不同容器=独立实例
+            }
+            let model_match = !model.is_empty()
+                && !s.model_path.is_empty()
+                && (s.model_path == model
+                    || s.model_path.starts_with(&model)
+                    || model.starts_with(&s.model_path));
+            if model_match {
+                // 同模型：仅当端口相同（或任一侧未知=0）才视为同一服务
+                return match (port, s.port) {
+                    (a, b) if a != 0 && b != 0 => a == b,
+                    _ => true,
+                };
+            }
+            port != 0 && s.port == port
         });
 
         let extra_args = match engine.as_str() {
@@ -899,7 +937,9 @@ pub fn detect(
         let short_cid = r.cid.get(..12).unwrap_or(&r.cid);
         let router_cname = cont.get(short_cid).map(|c| c.name.clone()).unwrap_or_default();
         let router_cimage = cont.get(short_cid).map(|c| c.image.clone()).unwrap_or_default();
-        let rport = r.ports.first().copied().unwrap_or(0);
+        let rport = container_args_port(&r.args)
+            .or_else(|| r.ports.first().copied())
+            .unwrap_or(0);
         let registered = existing.iter().any(|s| {
             s.server_id == server.id
                 && ((s.pid.is_some() && s.pid.unwrap() == r.pid)
