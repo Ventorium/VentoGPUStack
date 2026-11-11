@@ -1,0 +1,95 @@
+{
+  "version": "2026.11",
+  "updated": "2026-11-11",
+  "sources": [
+    "NVIDIA CUDA Toolkit Release Notes (latest): Table 2 CUDA Toolkit and Corresponding Driver Branch / Table 3 Minimum Required Driver Version",
+    "NVIDIA CUDA Toolkit 12.9.0 Release Notes (archive): Table 2/3 最低驱动版本",
+    "VentoGPUStack 机群实测（2026-11，nvidia-smi 上报值）"
+  ],
+  "note": "驱动向后兼容：新版驱动始终支持旧 CUDA 用户态库（API 超集）。CUDA 应用的要求是『目标驱动 >= 该 CUDA 版本所需最低驱动』。docker 推理镜像自带 CUDA 运行时（镜像 tag 中的 cu12x 即其 CUDA 版本），驱动只需满足该版本最低要求。",
+  "family_min_driver": {
+    "11.x": "450.80.02",
+    "12.x": "525.60.13",
+    "13.x": "580.65.06"
+  },
+  "cuda_min_driver": [
+    { "cuda": "12.0", "min_driver": "525.60.13", "branch": "R525" },
+    { "cuda": "12.1", "min_driver": "530.30.02", "branch": "R530" },
+    { "cuda": "12.2", "min_driver": "535.54.03", "branch": "R535" },
+    { "cuda": "12.3", "min_driver": "545.23.06", "branch": "R545" },
+    { "cuda": "12.4", "min_driver": "550.54.14", "branch": "R550" },
+    { "cuda": "12.5", "min_driver": "555.42.02", "branch": "R555" },
+    { "cuda": "12.6", "min_driver": "560.28.01", "branch": "R560" },
+    { "cuda": "12.7", "min_driver": "566.36", "branch": "R566" },
+    { "cuda": "12.8", "min_driver": "570.26", "branch": "R570" },
+    { "cuda": "12.9", "min_driver": "575.51.03", "branch": "R575", "verified": "12.9.0 发布说明 Table 2 实测值 575.51.03" },
+    { "cuda": "13.0", "min_driver": "580.65.06", "branch": "R580" },
+    { "cuda": "13.1", "min_driver": "580.65.06", "branch": "R590", "note": "13.x 家族最低 580（官方 minor-version 兼容范围 >=580）；13.1 对应分支 R590" }
+  ],
+  "branch_cuda": [
+    { "branch": "R515", "cuda": "12.2", "driver_range": "515.x" },
+    { "branch": "R525", "cuda": "12.0", "driver_range": "525.x" },
+    { "branch": "R530", "cuda": "12.1", "driver_range": "530.x" },
+    { "branch": "R535", "cuda": "12.2", "driver_range": "535.x" },
+    { "branch": "R545", "cuda": "12.3", "driver_range": "545.x" },
+    { "branch": "R550", "cuda": "12.4", "driver_range": "550.x" },
+    { "branch": "R555", "cuda": "12.5", "driver_range": "555.x" },
+    { "branch": "R560", "cuda": "12.6", "driver_range": "560.x" },
+    { "branch": "R565", "cuda": "12.6", "driver_range": "565.x" },
+    { "branch": "R566", "cuda": "12.7", "driver_range": "566.x" },
+    { "branch": "R570", "cuda": "12.8", "driver_range": "570.x" },
+    { "branch": "R575", "cuda": "12.9", "driver_range": "575.x" },
+    { "branch": "R580", "cuda": "13.0", "driver_range": "580.x" },
+    { "branch": "R590", "cuda": "13.1", "driver_range": "590.x" },
+    { "branch": "R595", "cuda": "13.2", "driver_range": "595.x" },
+    { "branch": "R610", "cuda": "13.3", "driver_range": "610.x" },
+    { "branch": "R615", "cuda": "13.4", "driver_range": "615.x" },
+    { "branch": "R620", "cuda": "13.5", "driver_range": "620.x" }
+  ],
+  "observed_fleet": [
+    { "driver": "515.65.01", "cuda": "12.2", "source": "机群 node12 实测" },
+    { "driver": "535.230.02", "cuda": "12.2", "source": "机群 node05/25 实测" },
+    { "driver": "545.29.06", "cuda": "12.3", "source": "机群 node16 实测" },
+    { "driver": "550.127.05", "cuda": "12.4", "source": "机群 node11/13 实测" },
+    { "driver": "550.144.03", "cuda": "12.4", "source": "机群 node08/09 实测（node04 升级前）" },
+    { "driver": "560.35.03", "cuda": "12.6", "source": "机群 node14 实测" },
+    { "driver": "570.181.00", "cuda": "12.8", "source": "机群 node18 实测（R570 分支）" },
+    { "driver": "575.57.08", "cuda": "12.9", "source": "机群 node21 实测（R575 分支）" },
+    { "driver": "580.126.09", "cuda": "13.0", "source": "机群 node07/17/19/30/31 实测（R580 分支）" },
+    { "driver": "590.48.01", "cuda": "13.1", "source": "机群 node04/15 实测（node04 2026-11 升级 e2e 验证，R590 分支）" }
+  ],
+  "frameworks": [
+    {
+      "name": "sglang",
+      "rule": "lmsysorg/sglang 镜像 tag 含 cu12x（如 v0.5.19-cu129 = CUDA 12.9），镜像自带 CUDA 运行时，驱动只需满足该 CUDA 最低驱动",
+      "examples": [
+        { "image": "lmsysorg/sglang:v0.5.19-cu129", "cuda": "12.9", "min_driver": "575.51.03" }
+      ]
+    },
+    {
+      "name": "vllm",
+      "rule": "vllm/vllm-openai 镜像按 CUDA 版本打标（如 :cu126 / :cu128 / 官方 nightly），取镜像 CUDA 版本的最低驱动",
+      "examples": []
+    },
+    {
+      "name": "triton",
+      "rule": "nvcr.io/nvidia/tritonserver 镜像 tag 含 CUDA 版本（如 24.09-py3 = CUDA 12.6），取镜像 CUDA 版本的最低驱动",
+      "examples": []
+    },
+    {
+      "name": "python 原生（torch 等）",
+      "rule": "裸 python/torch 进程无法从镜像推断 CUDA 版本，保守按『当前驱动已支持的 CUDA 版本』要求目标驱动不低于当前驱动",
+      "examples": []
+    }
+  ],
+  "rules": [
+    "驱动向后兼容：目标驱动高于当前驱动时，旧 CUDA 用户态库（含 docker 镜像内置）在更高分支驱动上继续可用；风险方向是『目标驱动过低』。",
+    "目标驱动 < 任一在跑负载所需最低驱动 => 阻断（block）：升级后该负载将无法加载 CUDA。",
+    "目标驱动所在分支在知识库 branch_cuda 中且其 CUDA >= 所需 CUDA => 兼容（safe/warn 取决于是否有机群验证案例）。",
+    "目标驱动超出知识库已收录分支（更新）=> warn：理论向后兼容，但集群内无验证案例，建议先在 1 台节点灰度。",
+    "目标驱动 = 当前驱动 => 无需升级。",
+    "机群实测 observed_fleet 中出现的版本为『已验证』版本，其余为『文档推断』版本。",
+    "存在未纳管 GPU 进程时：其负载类型未知，需人工确认后再升级（不影响 verdict，仅提示）。",
+    "驱动升级走 DKMS 原地安装（先卸旧模块），通常免重启；若安装脚本判定需重启则按任务 auto_reboot 策略执行。"
+  ]
+}

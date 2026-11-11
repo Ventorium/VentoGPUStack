@@ -311,10 +311,22 @@
         </div>
       </div>
       <div id="drvProgress" class="hidden" style="margin-bottom:16px"></div>
+
+      <div class="card" style="margin-bottom:16px;padding:16px">
+        <div class="section-title" style="padding:0 0 4px">🤖 操作助手（AI Agent）</div>
+        <div class="hint" style="margin-bottom:10px">用自然语言描述运维诉求（例如：“先停掉本机的 sglang 服务，把驱动升级到 590.48.01，再重启模型服务”）。Agent 会先生成受限步骤计划供你确认，确认后才逐步执行。可用动作：停止/启动/更新服务、升级驱动、等待。同一台机器已有升级任务或 Agent 任务执行中时不可重复发起。</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+          <div style="width:300px;max-width:100%"><label class="label">目标服务器</label><select class="select" id="agServer"></select></div>
+          <div style="flex:1;min-width:300px"><label class="label">任务描述</label><input class="input" id="agPrompt" placeholder="例如：先停 qwen3.8-fp8 服务，升级驱动到 595.71.05，最后重启该服务"></div>
+          <button class="btn btn-outline" id="btnAgPlan" onclick="agentPlan()">🧠 生成计划</button>
+        </div>
+        <div id="agPlan"></div>
+      </div>
+
       <div class="section-title">当前驱动矩阵</div>
       <div class="card">
         <table>
-          <thead><tr><th>服务器</th><th>驱动</th><th>CUDA</th><th>GPU</th><th>显存占用</th><th>在跑进程</th><th>在跑模型</th></tr></thead>
+          <thead><tr><th>服务器</th><th>驱动</th><th>CUDA</th><th>GPU</th><th>显存占用</th><th>GPU 进程</th><th>在跑模型</th><th style="width:110px">操作</th></tr></thead>
           <tbody id="drvMatrix"></tbody>
         </table>
       </div>
@@ -759,16 +771,37 @@ async function loadDriverMatrix() {
       const latest = (d.distinct_drivers || []).sort().pop();
       if (latest) $("drvTarget").value = latest;
     }
-    $("drvMatrix").innerHTML = d.rows.map((x) =>
-      `<tr>
+    agServerOptions();
+    loadAgentTasks();
+    $("drvMatrix").innerHTML = d.rows.map((x) => {
+      const procs = x.procs || [];
+      const un = x.unmanaged_gpu_procs || 0;
+      let procCell = '<span class="hint">-</span>';
+      if (x.online) {
+        if (procs.length) {
+          procCell = `<span class="badge ${un ? "badge-warn" : "badge-ok"}" title="${esc(procs.join("，"))}">${procs.length} 进程</span>` +
+            (un ? ` <span class="badge badge-err" title="存在 ${un} 个平台未纳管的 GPU 进程，直接升级驱动会被中止，需先人工处理">⚠ ${un} 未纳管</span>` : "");
+        } else {
+          procCell = '<span class="hint">无</span>';
+        }
+      }
+      const models = [
+        ...(x.models_in_use || []).map((m) =>
+          `<div class="cell-sub mono" title="${esc(m.path)} · 使用进程: ${esc((m.by || []).join(","))}">📦 ${esc(m.path.split("/").pop() || m.path)}</div>`),
+        ...(x.services || []).filter((s) => s.status === "running").map((s) =>
+          `<div class="cell-main" title="平台注册服务 · ${esc(s.deploy_type)} · 端口 ${s.port}">🤖 ${esc(s.name)} <span class="hint">:${s.port}</span></div>`),
+      ].join("");
+      return `<tr>
         <td><div class="cell-main">${esc(x.name)}</div><div class="cell-sub mono">${esc(x.host)}</div></td>
         <td class="mono">${esc(x.driver || "-")}</td>
         <td class="mono">${esc(x.cuda || "-")}</td>
         <td class="mono">${x.online ? x.gpus + " 张" : "离线"}</td>
         <td class="mono">${x.online ? x.vram_used_gb.toFixed(1) + " GB" : "-"}</td>
-        <td>${(x.procs || []).map((p) => `<span class="badge badge-muted" style="margin:1px 3px 1px 0">${esc(p)}</span>`).join("") || "-"}</td>
-        <td>${(x.models_in_use || []).map((m) => `<div class="cell-sub mono" title="${esc(m.path)}">${esc(m.by.join(",") || "空闲")}</div>`).join("") || "-"}</td>
-      </tr>`).join("") || '<tr><td colspan="7" class="empty">无数据</td></tr>';
+        <td>${procCell}</td>
+        <td>${models || '<span class="hint">-</span>'}</td>
+        <td style="white-space:nowrap">${x.online ? drvUpgradeBtn(x) : '<span class="hint">离线</span>'}</td>
+      </tr>`;
+    }).join("") || '<tr><td colspan="8" class="empty">无数据</td></tr>';
   } catch (e) { toast(e.message, true); }
 }
 
@@ -858,6 +891,9 @@ async function openDrvUpModal(sid) {
     </div>
     <label class="label">目标驱动版本</label>
     <input class="input mono" id="drvUpTarget" value="${esc(target)}" placeholder="如 595.71.05" style="width:220px">
+    <div id="drvUpCompat" style="margin-top:10px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--muted)">
+      <span class="hint"><span class="spinner"></span> 正在 AI 检查兼容性（在跑服务所需 CUDA 的最低驱动 vs 目标版本，依据知识库 + 该机在跑进程）…</span>
+    </div>
     <div style="margin-top:10px"><label class="label">目标 CUDA（可选）</label>
     <input class="input mono" id="drvUpCuda" value="${esc($("drvCuda").value || "")}" placeholder="如 12.4" style="width:160px"></div>
     <div style="margin-top:14px">
@@ -870,6 +906,15 @@ async function openDrvUpModal(sid) {
     ["取消", "closeModal()"],
     ["开始升级", `startDrvUp(${sid})`],
   ], true);
+  // 兼容性检查：打开时执行 + 目标版本变化时（1.2s 防抖）重新检查
+  const tInp = $("drvUpTarget");
+  if (tInp) {
+    tInp.addEventListener("input", () => {
+      clearTimeout(window._drvCompatTimer);
+      window._drvCompatTimer = setTimeout(() => checkDrvCompat(sid), 1200);
+    });
+  }
+  checkDrvCompat(sid);
   // 异步加载服务列表（不阻塞弹窗打开）
   try {
     const r = await api("/api/services", "GET", undefined, 120000);
@@ -883,6 +928,163 @@ async function openDrvUpModal(sid) {
     const el = $("drvUpSvcList");
     if (el) el.innerHTML = '<span class="hint">服务列表获取失败</span>';
   }
+}
+
+/* 兼容性检查：AI + 知识库（规则兜底），block 时禁用「开始升级」 */
+let drvCompatSeq = 0;
+async function checkDrvCompat(sid) {
+  const el = $("drvUpCompat");
+  const btn = $("modalFoot").querySelector(".btn-primary");
+  if (!el || !$("drvUpTarget")) return;
+  const target = $("drvUpTarget").value.trim();
+  if (!target || !/^\d+\.\d+\.\d+$/.test(target)) {
+    el.innerHTML = '<span class="hint">输入目标驱动版本（X.YY.ZZ）后自动检查兼容性</span>';
+    if (btn) btn.disabled = false;
+    return;
+  }
+  const my = ++drvCompatSeq;
+  el.innerHTML = '<span class="hint"><span class="spinner"></span> 正在检查兼容性（知识库 + 该机在跑进程，约 10–40 秒）…</span>';
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api("/api/driver-matrix/compat-check", "POST", { server_id: sid, target_driver: target }, 180000);
+    if (my !== drvCompatSeq) return;
+    if (!r.data || !r.data.ok) throw new Error((r.data && r.data.error) || "兼容性检查失败");
+    const d = r.data.data;
+    const v = d.verdict || {};
+    const reasons = (v.reasons || []).map((x) => `<li>${esc(x)}</li>`).join("");
+    const badge = v.verdict === "safe" ? '<span class="badge badge-ok">✅ 兼容，可安全升级</span>'
+      : v.verdict === "warn" ? '<span class="badge badge-warn">⚠️ 可升级，但需谨慎（灰度）</span>'
+      : '<span class="badge badge-err">🚫 不兼容，不建议升级</span>';
+    const meta = [];
+    if (v.required_cuda) meta.push(`在跑负载需要 CUDA ${esc(v.required_cuda)}`);
+    if (v.min_required_driver) meta.push(`最低驱动 ${esc(v.min_required_driver)}`);
+    if (v.max_compatible) meta.push(`已验证最高兼容版本 <b class="mono">${esc(v.max_compatible)}</b>`);
+    if (d.unmanaged_gpu_procs > 0) meta.push(`${d.unmanaged_gpu_procs} 个未纳管 GPU 进程`);
+    el.innerHTML =
+      `<div style="margin-bottom:4px">${badge} <span class="hint">${d.ai_used ? "AI 判定" : "规则判定（AI 不可用）"}</span></div>` +
+      (meta.length ? `<div class="hint" style="margin-bottom:4px">${meta.join(" · ")}</div>` : "") +
+      (reasons ? `<ul style="margin:0;padding-left:18px;font-size:12px;color:var(--muted-foreground)">${reasons}</ul>` : "");
+    if (btn) btn.disabled = v.verdict === "block";
+  } catch (e) {
+    if (my !== drvCompatSeq) return;
+    el.innerHTML = `<span class="hint">⚠️ 兼容性检查失败：${esc(e.message)}（仍可手动开始升级）</span>`;
+    if (btn) btn.disabled = false;
+  }
+}
+
+/* ================= 操作助手（AI Agent） ================= */
+let AG_TASK = null;
+let AG_POLL_TIMER = null;
+window.AG_EXECUTED_IDS = window.AG_EXECUTED_IDS || new Set();
+const AG_ACTION_NAMES = {
+  stop_service: "⏹ 停止服务", start_service: "▶ 启动服务", update_service: "✏️ 更新服务",
+  upgrade_driver: "⚡ 升级驱动", wait: "⏱ 等待",
+};
+function agServerOptions() {
+  const sel = $("agServer");
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = SERVERS.filter((s) => s.enabled).map((s) => {
+    const m = (window.DRV_MATRIX || []).find((x) => x.id === s.id);
+    return `<option value="${s.id}" ${String(s.id) === prev ? "selected" : ""}>${esc(s.name)}（${esc(s.host)}）· 驱动 ${esc((m && m.driver) || "未知")}</option>`;
+  }).join("");
+}
+function agStepIcon(st) {
+  if (st === "done") return '<span class="badge badge-ok">✓</span>';
+  if (st === "running") return '<span class="spinner"></span>';
+  if (st === "fail") return '<span class="badge badge-err">✗</span>';
+  if (st === "skip") return '<span class="badge badge-muted">跳过</span>';
+  return '<span class="badge badge-muted">○</span>';
+}
+function renderAgTask(t) {
+  const host = $("agPlan");
+  if (!host || !t) return;
+  const steps = (t.steps || []).map((s) => `
+    <div style="display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px solid var(--border)">
+      <div style="width:26px;flex:none;text-align:center">${agStepIcon(s.status)}</div>
+      <div style="flex:1;min-width:0">
+        <div><b>${esc(AG_ACTION_NAMES[s.action] || s.action)}</b><span class="hint" style="margin-left:8px">${esc(s.description || "")}</span></div>
+        <div class="mono hint" style="margin-top:2px;word-break:break-all">${esc(JSON.stringify(s.params || {}))}</div>
+        ${s.log ? `<div class="mono" style="font-size:11px;color:var(--muted-foreground);margin-top:4px;white-space:pre-wrap">${esc(s.log)}</div>` : ""}
+      </div>
+    </div>`).join("");
+  const phaseBadge = { running: '<span class="badge badge-run">运行中</span>', done: '<span class="badge badge-ok">已完成</span>', fail: '<span class="badge badge-err">失败</span>' }[t.phase] || "";
+  const canExec = t.phase === "running" && !window.AG_EXECUTED_IDS.has(t.id);
+  host.innerHTML = `
+    <div style="margin-top:12px;padding:12px 14px;border:1px solid var(--border);border-radius:8px;background:var(--muted)">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <b>${esc(t.prompt || "")}</b> ${phaseBadge}
+        ${canExec ? '<button class="btn btn-primary" style="padding:4px 12px" onclick="agentExecute()">▶ 确认执行计划</button>' : ""}
+      </div>
+      ${t.summary ? `<div class="hint" style="margin-top:6px">计划说明：${esc(t.summary)}</div>` : ""}
+      <div style="margin-top:8px">${steps}</div>
+      ${t.phase === "fail" && t.error ? `<div style="margin-top:8px"><span class="badge badge-err">${esc(t.error)}</span></div>` : ""}
+    </div>`;
+}
+function agStopPoll() { if (AG_POLL_TIMER) { clearInterval(AG_POLL_TIMER); AG_POLL_TIMER = null; } }
+async function agStartPoll() {
+  agStopPoll();
+  const tick = async () => {
+    try {
+      const r = await api("/api/driver-matrix/agent-status", "GET");
+      const rows = (r.data && r.data.data) || [];
+      const t = rows.find((x) => x.id === (AG_TASK && AG_TASK.id));
+      if (t) { AG_TASK = t; renderAgTask(t); }
+      if (t && (t.phase === "done" || t.phase === "fail")) {
+        agStopPoll();
+        toast(t.phase === "done" ? "Agent 任务已完成" : `Agent 任务失败：${t.error || ""}`, t.phase === "fail");
+        loadDriverMatrix();
+      }
+    } catch (_) { /* 轮询失败忽略 */ }
+  };
+  await tick();
+  AG_POLL_TIMER = setInterval(tick, 3000);
+}
+async function agentPlan() {
+  const sel = $("agServer");
+  const sid = Number(sel && sel.value);
+  const prompt = $("agPrompt").value.trim();
+  if (!sid) { toast("请选择目标服务器", true); return; }
+  if (!prompt) { toast("请输入任务描述", true); return; }
+  const btn = $("btnAgPlan");
+  btn.disabled = true;
+  btn.textContent = "🧠 正在生成…";
+  try {
+    const r = await api("/api/driver-matrix/agent-plan", "POST", { server_id: sid, prompt }, 120000);
+    if (!r.data || !r.data.ok) throw new Error((r.data && r.data.error) || "生成计划失败");
+    AG_TASK = r.data.data;
+    agStopPoll();
+    renderAgTask(AG_TASK);
+  } catch (e) {
+    toast(e.message, true);
+  }
+  btn.disabled = false;
+  btn.textContent = "🧠 生成计划";
+}
+async function agentExecute() {
+  if (!AG_TASK) return;
+  const n = (AG_TASK.steps || []).length;
+  if (!confirm(`将对服务器 ${AG_TASK.server_id} 执行 ${n} 步操作计划（可能包含停止/启动服务、驱动升级），确认执行？`)) return;
+  try {
+    const r = await api("/api/driver-matrix/agent-execute", "POST", { task_id: AG_TASK.id }, 30000);
+    if (!r.data || !r.data.ok) throw new Error((r.data && r.data.error) || "执行失败");
+    window.AG_EXECUTED_IDS.add(AG_TASK.id);
+    toast("Agent 已开始按计划执行");
+    agStartPoll();
+  } catch (e) { toast(e.message, true); }
+}
+async function loadAgentTasks() {
+  try {
+    const r = await api("/api/driver-matrix/agent-status", "GET");
+    const rows = (r.data && r.data.data) || [];
+    const active = rows.find((x) => x.phase === "running");
+    const t = active || (rows.length ? rows[rows.length - 1] : null);
+    if (t) {
+      AG_TASK = t;
+      renderAgTask(t);
+      if (t.phase === "running") agStartPoll();
+    }
+  } catch (_) { /* ignore */ }
 }
 
 async function startDrvUp(sid) {
@@ -1054,9 +1256,16 @@ function openRowMenu(e, key, items) {
   document.body.appendChild(el);
   ROW_MENU = el;
   const r = e.currentTarget.getBoundingClientRect();
-  el.style.top = Math.min(r.bottom + 6, window.innerHeight - 230) + "px";
+  // 先按「按钮下方」定位；测量真实高度后仅当下方放不下时才翻转到上方
+  const mh = el.offsetHeight;
+  const mw = el.offsetWidth;
+  let top = r.bottom + 6;
+  if (top + mh > window.innerHeight - 8) top = Math.max(8, r.top - mh - 6);
+  let right = Math.max(8, window.innerWidth - r.right);
+  if (right + mw > window.innerWidth - 8) right = Math.max(8, window.innerWidth - mw - 8);
+  el.style.top = top + "px";
   el.style.left = "auto";
-  el.style.right = Math.max(8, window.innerWidth - r.right) + "px";
+  el.style.right = right + "px";
   document.addEventListener("click", closeRowMenu);
   document.addEventListener("scroll", closeRowMenu, true);
 }
@@ -1072,7 +1281,6 @@ function toggleSvcMenu(e, id) { openRowMenu(e, "svc-" + id, svcMenuItems(id)); }
 function srvMenuItems(id) {
   return [
     { label: "SSH 测试", fn: `testServer(${id})` },
-    { label: "驱动升级", fn: `openDrvUpModal(${id})` },
     { label: "编辑服务器", fn: `openServerModal(${id})` },
     { sep: true, label: "删除服务器", fn: `deleteServer(${id})`, danger: true },
   ];

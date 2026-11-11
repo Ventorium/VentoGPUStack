@@ -59,12 +59,35 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     printf 'P|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$pid" "$name" "$gi" "$mem" "$cid" "$ppid" "$cmd" "$pcmd" "$rootcmd" "$rootpid"
   done
 fi
+echo "@@ROUTERS@@"
+# 非 GPU 路由进程（sglang-router 等，宿主网络容器）不会出现在 nvidia-smi 中，按进程名专扫
+ps -eo pid=,comm=,rss= 2>/dev/null | while read -r rpid rcomm rmem; do
+  [ -n "$rpid" ] || continue
+  case "$rcomm" in
+    sglang::router|sgl_router|sglang-router|sgl-router)
+      rcmd=$(tr '\0' ' ' < "/proc/$rpid/cmdline" 2>/dev/null | sed 's/|/\//g' | cut -c1-512)
+      rports=$(ss -tlnpH 2>/dev/null | awk -v p="pid=$rpid," 'index($0,p){a=$4;sub(/.*:/,"",a);print a}' | sort -nu | head -3 | paste -sd, -)
+      rcid=""; cur=$(ps -o ppid= -p "$rpid" 2>/dev/null | tr -d ' \t\n'); depth=0
+      while [ -n "$cur" ] && [ "$cur" != "1" ] && [ "$depth" -lt 6 ]; do
+        acmd=$(tr '\0' ' ' < "/proc/$cur/cmdline" 2>/dev/null | sed 's/|/\//g' | cut -c1-512)
+        if [ -z "$rcid" ] && [ -n "$acmd" ]; then
+          case "$acmd" in
+            *containerd-shim*) rcid=$(printf '%s\n' "$acmd" | sed -n 's/.*-id \([0-9a-f]\{12,\}\).*/\1/p' | head -1) ;;
+          esac
+        fi
+        cur=$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' \t\n'); depth=$((depth + 1))
+      done
+      printf 'R|%s|%s|%s|%s|%s|%s\n' "$rpid" "$rcomm" "$rports" "$rmem" "$rcid" "$rcmd"
+      ;;
+  esac
+done
 echo "@@DOCKER@@"
 if command -v docker >/dev/null 2>&1; then
-  # 一次 docker ps 同时取 短id/容器名/镜像，避免逐容器 inspect 慢调用拖超时
+  # 一次 docker ps 同时取 短id/容器名/镜像，docker port 补发布端口（桥接网络；宿主网络为空）
   docker ps --format '{{.ID}} {{.Names}} {{.Image}}' 2>/dev/null | head -40 | while read -r cid nm image; do
     [ -n "$cid" ] || continue
-    printf 'D|%s|%s|%s\n' "$cid" "$nm" "$image"
+    ports=$(docker port "$cid" 2>/dev/null | awk -F' -> ' '{split($2,a,":");print a[length(a)]}' | sort -nu | head -3 | paste -sd, -)
+    printf 'D|%s|%s|%s|%s\n' "$cid" "$nm" "$image" "$ports"
   done
 fi
 echo "@@END@@"
@@ -95,6 +118,21 @@ pub struct Container {
     pub cid: String,
     pub name: String,
     pub image: String,
+    /// docker port 解析出的宿主机发布端口（宿主网络容器为空）
+    pub ports: Vec<u16>,
+}
+
+/// 非 GPU 的路由/网关类进程（如 sglang-router）：不进 nvidia-smi，需按 comm 专扫。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RouterProc {
+    pub pid: u32,
+    pub name: String,
+    /// 监听端口（ss 解析，最多 3 个）
+    pub ports: Vec<u16>,
+    pub mem_mib: u32,
+    /// 归属容器 id（空 = 宿主机进程）
+    pub cid: String,
+    pub cmdline: String,
 }
 
 /// 一台机器的深扫结果。
@@ -102,6 +140,7 @@ pub struct Container {
 pub struct DiscoverResult {
     pub procs: Vec<DeepProc>,
     pub containers: Vec<Container>,
+    pub routers: Vec<RouterProc>,
 }
 
 /// 对一台机器执行一次深扫（一次 SSH 往返）。
@@ -124,6 +163,10 @@ pub async fn discover_one(
         let l = line.trim_end();
         if l == "@@PROCDEEP@@" {
             cur = "proc";
+            continue;
+        }
+        if l == "@@ROUTERS@@" {
+            cur = "router";
             continue;
         }
         if l == "@@DOCKER@@" {
@@ -174,14 +217,43 @@ pub async fn discover_one(
                 let Some(rest) = l.strip_prefix("D|") else {
                     continue;
                 };
-                let parts: Vec<&str> = rest.splitn(3, '|').collect();
+                let parts: Vec<&str> = rest.splitn(4, '|').collect();
                 if parts.len() < 3 {
                     continue;
                 }
+                let ports: Vec<u16> = parts
+                    .get(3)
+                    .unwrap_or(&"")
+                    .split(',')
+                    .filter_map(|p| p.trim().parse().ok())
+                    .collect();
                 out.containers.push(Container {
                     cid: parts[0].to_string(),
                     name: parts[1].to_string(),
                     image: parts[2].to_string(),
+                    ports,
+                });
+            }
+            "router" => {
+                let Some(rest) = l.strip_prefix("R|") else {
+                    continue;
+                };
+                let parts: Vec<&str> = rest.splitn(6, '|').collect();
+                if parts.len() < 6 {
+                    continue;
+                }
+                let pid: u32 = parts[0].parse().unwrap_or(0);
+                if pid == 0 {
+                    continue;
+                }
+                let ports: Vec<u16> = parts[2].split(',').filter_map(|p| p.trim().parse().ok()).collect();
+                out.routers.push(RouterProc {
+                    pid,
+                    name: parts[1].to_string(),
+                    ports,
+                    mem_mib: parts[3].parse().unwrap_or(0) / 1024,
+                    cid: parts[4].to_string(),
+                    cmdline: parts[5].to_string(),
                 });
             }
             _ => {}
@@ -351,7 +423,16 @@ pub fn extract_model_path(cmdline: &str, known: &[String]) -> (String, bool) {
 pub fn classify(name: &str, cmdline: &str) -> &'static str {
     let c = cmdline.to_lowercase();
     let n = name.to_lowercase();
-    if n.starts_with("vllm")
+    if n.contains("sglang::router")
+        || n.contains("sgl_router")
+        || n.contains("sglang-router")
+        || n.contains("sgl-router")
+        || c.contains("sglang_router")
+        || c.contains("sglang-router")
+        || c.contains("sgl-router")
+    {
+        "sglang-router"
+    } else if n.starts_with("vllm")
         || c.contains("vllm.entrypoints")
         || c.contains("vllm serve")
         || n.contains("vllm::")
@@ -376,10 +457,11 @@ pub fn classify(name: &str, cmdline: &str) -> &'static str {
     }
 }
 
-/// 引擎排序权重：推理引擎优先，其次 python，最后 other。
-fn engine_rank(e: &str) -> u8 {
+/// 引擎排序权重：推理引擎优先（路由跟随引擎在前），其次 python，最后 other。
+pub fn engine_rank(e: &str) -> u8 {
     match e {
-        "vllm" | "sglang" | "triton" | "xinference" | "paddlex" | "funasr" | "ollama" => 0,
+        "vllm" | "sglang" | "sglang-router" | "triton" | "xinference" | "paddlex" | "funasr"
+        | "ollama" => 0,
         "python" => 1,
         _ => 2,
     }
@@ -520,7 +602,7 @@ pub fn detect(
             None => procs.push(p.clone()),
         }
     }
-    if procs.is_empty() {
+    if procs.is_empty() && dr.routers.is_empty() {
         return Vec::new();
     }
     for p in &mut procs {
@@ -565,23 +647,46 @@ pub fn detect(
         changed = false;
         let groups = build_groups(&mut uf);
         let mut model_of: HashMap<String, String> = HashMap::new();
+        let mut port_of: HashMap<String, u16> = HashMap::new();
+        let mut cid_of: HashMap<String, String> = HashMap::new();
         for (root, idxs) in &groups {
             let mut best = String::new();
+            let mut port = 0u16;
+            let mut cid = String::new();
             for &i in idxs {
-                let (mdl, _) = extract_model_path(eff_cmd(&procs[i]), &known);
+                let cmd = eff_cmd(&procs[i]);
+                let (mdl, _) = extract_model_path(cmd, &known);
                 if mdl.len() > best.len() {
                     best = mdl;
                 }
+                if port == 0 {
+                    let toks = tokens_of(cmd);
+                    port = flag_value(&toks, &["--port", "--http-port"])
+                        .and_then(|v| v.parse::<u16>().ok())
+                        .unwrap_or(0);
+                }
+                if cid.is_empty() {
+                    cid = procs[i].cid.clone();
+                }
             }
             model_of.insert(root.clone(), best);
+            port_of.insert(root.clone(), port);
+            cid_of.insert(root.clone(), cid);
         }
         let roots: Vec<String> = groups.keys().cloned().collect();
         for a in 0..roots.len() {
             for b in (a + 1)..roots.len() {
                 let (ma, mb) = (&model_of[&roots[a]], &model_of[&roots[b]]);
                 if !ma.is_empty() && ma == mb {
-                    uf.union(&roots[a], &roots[b]);
-                    changed = true;
+                    // 同模型但容器归属 / 端口冲突时视为不同实例，不合并
+                    let (pa, pb) = (port_of[&roots[a]], port_of[&roots[b]]);
+                    let (ca, cb) = (&cid_of[&roots[a]], &cid_of[&roots[b]]);
+                    let same_container = (ca.is_empty() && cb.is_empty()) || (!ca.is_empty() && ca == cb);
+                    let same_port = !(pa != 0 && pb != 0 && pa != pb);
+                    if same_container && same_port {
+                        uf.union(&roots[a], &roots[b]);
+                        changed = true;
+                    }
                 }
             }
         }
@@ -630,7 +735,7 @@ pub fn detect(
         }
         let engine = classify(&proc_name, &rep_cmd).to_string();
         let (model, model_known) = extract_model_path(&rep_cmd, &known);
-        let port = flag_value(&toks, &["--port", "--http-port"])
+        let mut port = flag_value(&toks, &["--port", "--http-port"])
             .and_then(|v| v.parse::<u16>().ok())
             .unwrap_or(0);
         let tp = flag_value(&toks, &["--tensor-parallel-size", "--tensor-parallel", "--tp", "--tp-size", "-tp"])
@@ -690,7 +795,7 @@ pub fn detect(
                 .unwrap_or(0)
         };
 
-        let (cname, cimage) = members
+        let (cname, cimage, cports) = members
             .iter()
             .find(|m| !m.cid.is_empty())
             .and_then(|m| {
@@ -698,8 +803,13 @@ pub fn detect(
                 let short = m.cid.get(..12).unwrap_or(&m.cid);
                 cont.get(short)
             })
-            .map(|c| (c.name.clone(), c.image.clone()))
+            .map(|c| (c.name.clone(), c.image.clone(), c.ports.clone()))
             .unwrap_or_default();
+
+        // 进程命令行里没有 --port 时（sglang 默认端口等），回退到容器发布端口
+        if port == 0 {
+            port = cports.first().copied().unwrap_or(0);
+        }
 
         let mut model_name = String::new();
         for m in &members {
@@ -734,7 +844,9 @@ pub fn detect(
                     && (s.model_path == model
                         || s.model_path.starts_with(&model)
                         || model.starts_with(&s.model_path)))
-                    || (s.pid.is_some() && (pids_in.contains(&s.pid.unwrap()) || s.pid == Some(pid))))
+                    || (s.pid.is_some() && (pids_in.contains(&s.pid.unwrap()) || s.pid == Some(pid)))
+                    || (!cname.is_empty() && s.container_name == cname)
+                    || (port != 0 && s.port == port))
         });
 
         let extra_args = match engine.as_str() {
@@ -766,6 +878,45 @@ pub fn detect(
             extra_args,
             container_name: cname,
             container_image: cimage,
+            registered,
+        });
+    }
+
+    // 5) 非 GPU 路由进程（sglang-router 等）：不占卡、独立成候选
+    for r in &dr.routers {
+        let short_cid = r.cid.get(..12).unwrap_or(&r.cid);
+        let router_cname = cont.get(short_cid).map(|c| c.name.clone()).unwrap_or_default();
+        let router_cimage = cont.get(short_cid).map(|c| c.image.clone()).unwrap_or_default();
+        let rport = r.ports.first().copied().unwrap_or(0);
+        let registered = existing.iter().any(|s| {
+            s.server_id == server.id
+                && ((s.pid.is_some() && s.pid.unwrap() == r.pid)
+                    || (!router_cname.is_empty() && s.container_name == router_cname)
+                    || (rport != 0 && s.port == rport))
+        });
+        out.push(Detected {
+            server_id: server.id,
+            server_name: server.name.clone(),
+            host: server.host.clone(),
+            driver_version: driver_version.clone(),
+            cuda_version: cuda_version.clone(),
+            engine: "sglang-router".to_string(),
+            pid: r.pid,
+            pids: vec![r.pid],
+            proc_name: r.name.clone(),
+            gpus: Vec::new(),
+            mem_mib: r.mem_mib,
+            cmdline: r.cmdline.clone(),
+            model_path: String::new(),
+            model_name: String::new(),
+            model_known: false,
+            model_size_gb: 0.0,
+            model_kind: String::new(),
+            port: rport,
+            tp: 0,
+            extra_args: String::new(),
+            container_name: router_cname,
+            container_image: router_cimage,
             registered,
         });
     }

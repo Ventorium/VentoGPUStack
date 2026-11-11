@@ -220,6 +220,114 @@ pub fn unwrap_llm_json(v: &serde_json::Value) -> serde_json::Value {
     v.clone()
 }
 
+// ---------------------------------------------------------------------------
+// 驱动兼容检查 / Agent 操作计划 prompt
+// ---------------------------------------------------------------------------
+
+/// 驱动升级兼容性检查 prompt：结合知识库与机器在跑负载，判定目标驱动是否安全。
+pub fn compat_check_prompt(
+    server: &ServerConf,
+    st: &ServerStatus,
+    target_driver: &str,
+    kb: &str,
+) -> String {
+    let data = serde_json::json!({
+        "task": "判断把该机的 NVIDIA 驱动升级到 target_driver 是否安全（核心依据：在跑负载所需的最低驱动版本 vs 目标驱动）",
+        "server": {
+            "name": server.name,
+            "host": server.host,
+            "current_driver": st.driver_version,
+            "current_cuda": st.cuda_version,
+        },
+        "registered_services": st.models.iter().map(|m| serde_json::json!({
+            "path": m.path,
+            "in_use_by": m.in_use_by,
+        })).collect::<Vec<_>>(),
+        "running_gpu_processes": st.procs.iter().map(|p| serde_json::json!({
+            "name": p.name,
+            "cmdline": p.cmdline.chars().take(200).collect::<String>(),
+        })).collect::<Vec<_>>(),
+        "target_driver": target_driver,
+        "knowledge_base": kb,
+        "output_format": {
+            "verdict": "safe / warn / block 三选一：block=目标驱动低于某在跑负载所需最低驱动（升级后该负载必挂）；safe=满足所有最低驱动要求；warn=理论兼容但超出知识库已验证范围或存在未纳管 GPU 进程需人工确认",
+            "max_compatible": "知识库中该机在跑负载所支持的『已验证最高驱动版本』（取 observed_fleet 中 CUDA 满足要求且分支最高的驱动；无依据则填知识库 branch_cuda 中最高驱动段）",
+            "required_cuda": "在跑负载中最高的 CUDA 版本要求（如 12.9；docker 镜像按 tag cu12x 判断；无法判断时按 current_cuda 保守处理）",
+            "min_required_driver": "required_cuda 对应的最低驱动版本（来自知识库 cuda_min_driver）",
+            "reasons": ["中文要点数组：说明判定依据，如某负载需要 CUDA x.y 最低驱动 z.z"]
+        }
+    });
+    format!(
+        "{}{}",
+        serde_json::to_string_pretty(&data).unwrap_or_default(),
+        "要求：1. 只依据输入的知识库与负载信息判断，不要编造版本。2. 目标驱动低于 min_required_driver 必须给 block；高于知识库已收录的最高分支给 warn；其余给 safe。3. 最后只输出一个 JSON 对象（不要 markdown 代码块、不要多余文字），严格使用 output_format 的键名。\n"
+    )
+}
+
+/// Agent 操作计划 prompt：把用户的自然语言运维诉求转成受限动作序列。
+pub fn agent_plan_prompt(
+    server: &ServerConf,
+    st: &ServerStatus,
+    services: &[&ServiceConf],
+    prompt: &str,
+    kb: &str,
+) -> String {
+    let svcs: Vec<serde_json::Value> = services
+        .iter()
+        .map(|sv| {
+            serde_json::json!({
+                "id": sv.id,
+                "name": sv.name,
+                "model_path": sv.model_path,
+                "port": sv.port,
+                "deploy_type": sv.deploy_type.as_str(),
+                "docker_image": sv.docker_image,
+                "docker_args": sv.docker_args,
+                "status": sv.status,
+                "pid": sv.pid,
+                "container_name": sv.container_name,
+                "stop_pattern": sv.stop_pattern,
+            })
+        })
+        .collect();
+    let data = serde_json::json!({
+        "task": "为用户的运维诉求生成在该机器上执行的操作计划（步骤化、可逐步执行）",
+        "server": {
+            "id": server.id,
+            "name": server.name,
+            "host": server.host,
+            "current_driver": st.driver_version,
+            "current_cuda": st.cuda_version,
+            "gpus": st.gpus.len(),
+        },
+        "registered_services": svcs,
+        "running_gpu_processes": st.procs.iter().map(|p| serde_json::json!({
+            "pid": p.pid,
+            "name": p.name,
+            "gpus": p.gpu_idx,
+            "cmdline": p.cmdline.chars().take(160).collect::<String>(),
+        })).collect::<Vec<_>>(),
+        "driver_kb_summary": kb,
+        "user_request": prompt,
+        "actions_vocabulary": {
+            "stop_service": {"service_id": "整数，必须是 registered_services 中的 id", "description": "中文说明"},
+            "start_service": {"service_id": "整数，必须是 registered_services 中的 id", "description": "中文说明"},
+            "update_service": {"service_id": "整数", "model_path": "要替换成的新模型路径", "description": "中文说明（热切换模型后由后续 start 生效）"},
+            "upgrade_driver": {"target_driver": "三段式版本号 如 590.48.01", "auto_reboot": "true/false", "description": "中文说明"},
+            "wait": {"seconds": "整数，1..=600", "description": "中文说明"}
+        },
+        "output_format": {
+            "summary": "一句话中文说明整体思路",
+            "steps": [ {"action": "动作名", "params": "对应动作的参数对象", "description": "中文说明"} ]
+        }
+    });
+    format!(
+        "{}{}",
+        serde_json::to_string_pretty(&data).unwrap_or_default(),
+        "要求：1. steps 不超过 10 步；每步必须是 actions_vocabulary 中的动作之一，service_id 必须真实存在，不得编造。2. 涉及驱动升级时必须先 stop_service 停掉该机的 GPU 服务，升级完成后再 start_service 恢复；无法安全完成的诉求，只输出无法执行的说明，不要硬造步骤。3. 最后只输出一个 JSON 对象（不要 markdown 代码块、不要多余文字），严格使用 output_format 的键名。\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

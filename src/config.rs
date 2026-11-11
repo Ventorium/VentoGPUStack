@@ -241,6 +241,9 @@ pub struct ServiceConf {
     /// 停止时 pkill 的匹配模式；留空则用 model_path
     #[serde(default)]
     pub stop_pattern: String,
+    /// 纳管的外部 docker 容器名（智能检测纳管时记录）；Docker 服务停止时优先精确 stop 该容器
+    #[serde(default)]
+    pub container_name: String,
     #[serde(default)]
     pub status: ServiceStatus,
     #[serde(default)]
@@ -486,6 +489,49 @@ impl DrvTask {
 }
 
 // ---------------------------------------------------------------------------
+// Agent 操作计划任务（LLM 生成步骤化计划并逐步执行；内存态，进程重启即清空）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentStep {
+    pub idx: u32,
+    /// stop_service | start_service | upgrade_driver | update_service | wait
+    pub action: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+    #[serde(default)]
+    pub description: String,
+    /// pending | running | done | fail | skip
+    pub status: String,
+    #[serde(default)]
+    pub log: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentTask {
+    pub id: String,
+    pub server_id: u64,
+    pub prompt: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub steps: Vec<AgentStep>,
+    /// running | done | fail
+    pub phase: String,
+    pub started_at: i64,
+    #[serde(default)]
+    pub finished_at: i64,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl AgentTask {
+    pub fn active(&self) -> bool {
+        self.phase == "running"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 共享运行时状态
 // ---------------------------------------------------------------------------
 
@@ -504,6 +550,8 @@ pub struct AppState {
     pub audit: AuditLog,
     /// server.id -> 进行中的驱动升级任务（内存态，进程重启即清空）
     pub drv_tasks: std::sync::Arc<std::sync::Mutex<HashMap<u64, DrvTask>>>,
+    /// 进行中的 Agent 操作计划任务（内存态，进程重启即清空）
+    pub agent_tasks: std::sync::Arc<std::sync::Mutex<HashMap<String, AgentTask>>>,
 }
 
 impl AppState {
@@ -530,6 +578,7 @@ impl AppState {
             refresh_inflight: std::sync::atomic::AtomicBool::new(false),
             audit: AuditLog::new(audit_path),
             drv_tasks: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            agent_tasks: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 

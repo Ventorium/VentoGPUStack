@@ -29,6 +29,13 @@ pub fn model_exists(status: &ServerStatus, model_path: &str) -> bool {
 
 /// 生成启动命令。gpus 为 CUDA_VISIBLE_DEVICES 的卡号列表。
 pub fn build_start_cmd(service: &ServiceConf, gpus: &[u32]) -> String {
+    // 纳管的外部容器：按容器名幂等启动（已运行则无操作），不涉及 GPU 选择
+    if !service.container_name.trim().is_empty() {
+        let cname = service.container_name.trim();
+        return format!(
+            "docker start {cname} 2>/dev/null && echo vgs_started; docker inspect -f '{{{{.State.Status}}}}' {cname} 2>/dev/null || echo unknown"
+        );
+    }
     let cvd: Vec<String> = gpus.iter().map(|g| g.to_string()).collect();
     let cvd = cvd.join(",");
     let log = format!("/tmp/vgs_{}.log", service.id);
@@ -111,6 +118,15 @@ fn pkill_safe_pattern(pattern: &str) -> String {
 /// 集群服务多为 root/其他用户运行：先 `sudo -n` 信号（可杀任意属主），
 /// 无免密 sudo 的机器上自动回退为本用户信号（平台自管的进程仍可停止）。
 pub fn build_stop_cmd(service: &ServiceConf) -> String {
+    // 纳管的外部容器（任何 deploy_type）：优先按容器名精确停止，
+    // 避免 pkill 误伤同机同模型路径的其它实例
+    if !service.container_name.trim().is_empty() {
+        let cname = service.container_name.trim().to_string();
+        return format!(
+            "{}; echo stopped",
+            sig(&format!("docker stop -t 60 {cname} 2>/dev/null"))
+        );
+    }
     let pattern = if service.stop_pattern.trim().is_empty() {
         service.model_path.clone()
     } else {

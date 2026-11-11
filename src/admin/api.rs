@@ -710,12 +710,28 @@ async fn routes_driver_matrix(
     if second == Some("analyze") && method == "POST" {
         return route_analyze(session, state, user, ip).await;
     }
+    if second == Some("compat-check") && method == "POST" {
+        return route_compat_check(session, state, user, ip).await;
+    }
+    if second == Some("kb") && method == "GET" {
+        return route_compat_kb(session, state).await;
+    }
+    if second == Some("agent-plan") && method == "POST" {
+        return route_agent_plan(session, state, user, ip).await;
+    }
+    if second == Some("agent-execute") && method == "POST" {
+        return route_agent_execute(session, state, user, ip).await;
+    }
+    if second == Some("agent-status") && method == "GET" {
+        return route_agent_status(session, state).await;
+    }
     if method != "GET" {
         return fail(session, 405, "method not allowed").await;
     }
 
     let servers = state.servers.load();
     let statuses = state.statuses.load();
+    let services_all = state.services.load();
     let mut distinct: Vec<String> = Vec::new();
     let rows: Vec<Value> = servers
         .servers
@@ -726,6 +742,26 @@ async fn routes_driver_matrix(
             if !drv.is_empty() && !distinct.contains(&drv) {
                 distinct.push(drv.clone());
             }
+            let server_services: Vec<&ServiceConf> = services_all
+                .services
+                .iter()
+                .filter(|sv| sv.server_id == s.id)
+                .collect();
+            let unmanaged = st
+                .map(|x| {
+                    x.procs
+                        .iter()
+                        .filter(|p| {
+                            !server_services.iter().any(|sv| {
+                                (!sv.model_path.is_empty() && p.cmdline.contains(&sv.model_path))
+                                    || (!sv.stop_pattern.trim().is_empty()
+                                        && p.cmdline.contains(sv.stop_pattern.trim()))
+                                    || sv.pid.map(|pid| pid == p.pid).unwrap_or(false)
+                            })
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
             json!({
                 "id": s.id,
                 "name": s.name,
@@ -736,8 +772,16 @@ async fn routes_driver_matrix(
                 "gpus": st.map(|x| x.gpus.len()).unwrap_or(0),
                 "vram_used_gb": st.map(|x| x.gpus.iter().map(|g| g.used_mib).sum::<u32>() as f64 / 1024.0).unwrap_or(0.0),
                 "procs": st.map(|x| x.procs.iter().map(|p| p.name.clone()).collect::<Vec<_>>()).unwrap_or_default(),
+                "unmanaged_gpu_procs": unmanaged,
                 "models_in_use": st.map(|x| x.models.iter().filter(|m| !m.in_use_by.is_empty())
                     .map(|m| json!({"path": m.path, "by": m.in_use_by})).collect::<Vec<_>>()).unwrap_or_default(),
+                "services": server_services.iter().map(|sv| json!({
+                    "id": sv.id,
+                    "name": sv.name,
+                    "port": sv.port,
+                    "deploy_type": sv.deploy_type,
+                    "status": sv.status,
+                })).collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -1060,6 +1104,951 @@ async fn route_drv_upgrade_start(
         &json!({"ok": true, "data": {"server_id": id, "phase": "preparing", "target_driver": target}}),
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// 驱动兼容检查（知识库 + LLM/规则）与 Agent 操作助手
+// ---------------------------------------------------------------------------
+
+/// 驱动-CUDA 兼容知识库（来源与机群验证记录见 kb/driver_compat.json）。
+const COMPAT_KB: &str = include_str!("kb/driver_compat.json");
+
+/// 驱动版本解析为三段数字元组（缺段补 0，如 "570.181" → [570,181,0]）。
+fn ver3(v: &str) -> [u32; 3] {
+    let mut a = [0u32; 3];
+    for (i, p) in v.split('.').enumerate().take(3) {
+        a[i] = p.parse().unwrap_or(0);
+    }
+    a
+}
+
+/// 比较两个驱动版本号。
+fn cmp_driver_ver(a: &str, b: &str) -> std::cmp::Ordering {
+    ver3(a).cmp(&ver3(b))
+}
+
+/// 统计机器上未纳管的 GPU 进程数（进程名/cmdline/pid 均不匹配任一注册服务）。
+fn count_unmanaged_gpu_procs(svcs: &[&ServiceConf], st: &ServerStatus) -> usize {
+    st.procs
+        .iter()
+        .filter(|p| {
+            !svcs.iter().any(|sv| {
+                (!sv.model_path.is_empty() && p.cmdline.contains(&sv.model_path))
+                    || (!sv.stop_pattern.trim().is_empty()
+                        && p.cmdline.contains(sv.stop_pattern.trim()))
+                    || sv.pid.map(|pid| pid == p.pid).unwrap_or(false)
+            })
+        })
+        .count()
+}
+
+/// 从进程 cmdline 中提取在跑负载所需的最高 CUDA 版本（docker 镜像 tag cu12x，如 cu129 → 12.9）。
+fn required_cuda_from_procs(st: &ServerStatus) -> Option<(u32, u32)> {
+    let mut best: Option<(u32, u32)> = None;
+    for p in &st.procs {
+        let c: Vec<char> = p.cmdline.chars().collect();
+        let mut i = 0usize;
+        while i + 4 < c.len() {
+            if c[i] == 'c' && c[i + 1] == 'u' {
+                let (Some(m1), Some(m2), Some(mn)) = (
+                    c[i + 2].to_digit(10),
+                    c[i + 3].to_digit(10),
+                    c[i + 4].to_digit(10),
+                ) else {
+                    i += 1;
+                    continue;
+                };
+                let followed = i + 5 < c.len() && c[i + 5].is_ascii_digit();
+                let preceded = i > 0 && c[i - 1].is_ascii_alphanumeric();
+                if !followed && !preceded && (11..=13).contains(&m1) && mn <= 9 {
+                    let v = (m1 * 10 + m2, mn);
+                    if best.map_or(true, |b| v > b) {
+                        best = Some(v);
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    best
+}
+
+/// 规则兜底兼容判定：目标驱动低于在跑负载所需最低驱动 → block；
+/// 高于机群已验证最高驱动 → warn（灰度建议）；其余 safe。
+fn rule_compat_check(st: &ServerStatus, target: &str, unmanaged: usize) -> Value {
+    let kb: Value = serde_json::from_str(COMPAT_KB).unwrap_or(Value::Null);
+    let req = required_cuda_from_procs(st);
+    let req_cuda_str = match req {
+        Some((maj, mn)) => format!("{maj}.{mn}"),
+        None => st.cuda_version.trim().to_string(),
+    };
+    let min_driver = kb
+        .get("cuda_min_driver")
+        .and_then(|x| x.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|e| e.get("cuda").and_then(|c| c.as_str()) == Some(req_cuda_str.as_str()))
+        })
+        .and_then(|e| e.get("min_driver"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let mut reasons: Vec<String> = Vec::new();
+    let mut verdict = "safe".to_string();
+    let mut max_compatible = String::new();
+    if let Some(md) = &min_driver {
+        if cmp_driver_ver(target, md) == std::cmp::Ordering::Less {
+            verdict = "block".to_string();
+            reasons.push(format!(
+                "在跑负载需要 CUDA {req_cuda_str}（最低驱动 {md}），目标 {target} 低于该版本，升级后负载将无法运行"
+            ));
+        } else {
+            reasons.push(format!(
+                "在跑负载需要 CUDA {req_cuda_str}（最低驱动 {md}），目标 {target} 满足要求，理论兼容"
+            ));
+        }
+        if let Some(obs) = kb.get("observed_fleet").and_then(|x| x.as_array()) {
+            let mut best: Option<String> = None;
+            for e in obs {
+                let (Some(d), Some(c)) = (
+                    e.get("driver").and_then(|x| x.as_str()),
+                    e.get("cuda").and_then(|x| x.as_str()),
+                ) else {
+                    continue;
+                };
+                let cuda_ok = match req {
+                    Some((maj, mn)) => {
+                        let (om, omn) = match c.split_once('.') {
+                            Some((a, b)) => (a.parse::<u32>().unwrap_or(0), b.parse::<u32>().unwrap_or(0)),
+                            None => (0, 0),
+                        };
+                        (om, omn) >= (maj, mn)
+                    }
+                    None => true,
+                };
+                if cuda_ok
+                    && cmp_driver_ver(d, md) != std::cmp::Ordering::Less
+                    && best.as_ref().map_or(true, |b| cmp_driver_ver(d, b) == std::cmp::Ordering::Greater)
+                {
+                    best = Some(d.to_string());
+                }
+            }
+            max_compatible = best.unwrap_or_else(|| target.to_string());
+            if verdict != "block" && cmp_driver_ver(target, &max_compatible) == std::cmp::Ordering::Greater {
+                verdict = "warn".to_string();
+                reasons.push(format!(
+                    "目标 {target} 超出机群已验证最高驱动 {max_compatible}（已验证支持 CUDA {req_cuda_str}）：驱动向后兼容，理论可行但无集群验证案例，建议单节点灰度"
+                ));
+            }
+        }
+    } else {
+        verdict = "warn".to_string();
+        reasons.push(format!("知识库未收录 CUDA {req_cuda_str} 的最低驱动要求，请人工核对 NVIDIA 官方文档"));
+    }
+    if req.is_none() && !st.procs.is_empty() {
+        reasons.push("进程命令行未发现 cu12x 镜像标识，按当前驱动 CUDA 版本作为下限（保守估计）".to_string());
+    }
+    if unmanaged > 0 {
+        if verdict == "safe" {
+            verdict = "warn".to_string();
+        }
+        reasons.push(format!(
+            "存在 {unmanaged} 个未纳管的 GPU 进程，平台不会强杀未知进程，升级前请人工确认其兼容性"
+        ));
+    }
+    json!({
+        "verdict": verdict,
+        "max_compatible": max_compatible,
+        "required_cuda": req_cuda_str,
+        "min_required_driver": min_driver.unwrap_or_default(),
+        "reasons": reasons,
+    })
+}
+
+#[derive(Deserialize, Default)]
+pub struct CompatCheckPayload {
+    #[serde(default)]
+    pub server_id: u64,
+    #[serde(default)]
+    pub target_driver: String,
+}
+
+/// POST /api/driver-matrix/compat-check {server_id, target_driver}
+/// 驱动升级兼容性检查：LLM + 知识库研判，失败回退规则引擎；规则引擎对 block 具有一票否决。
+async fn route_compat_check(
+    session: &mut Session,
+    state: &Arc<AppState>,
+    user: &str,
+    ip: &str,
+) {
+    let v = parse_body(session).await.unwrap_or(Value::Null);
+    let p: CompatCheckPayload = match serde_json::from_value(v) {
+        Ok(x) => x,
+        Err(_) => return fail(session, 400, "参数错误：需要 server_id 与 target_driver").await,
+    };
+    let target = p.target_driver.trim().to_string();
+    if !valid_driver_ver(&target) {
+        return fail(
+            session,
+            400,
+            &format!("版本号格式不正确：{target}。需要三段数字 X.YY.ZZ"),
+        )
+        .await;
+    }
+    let Some(server) = state.find_server(p.server_id) else {
+        return fail(session, 404, "服务器不存在").await;
+    };
+    let Some(st) = state.status_of(p.server_id) else {
+        return fail(session, 409, "该机器状态未知，请先在服务器列表刷新后再检查").await;
+    };
+    if !st.online {
+        return fail(session, 409, &format!("机器离线（{}），不能检查", st.error)).await;
+    }
+    let services_all = state.services.load();
+    let server_services: Vec<&ServiceConf> = services_all
+        .services
+        .iter()
+        .filter(|sv| sv.server_id == p.server_id)
+        .collect();
+    let unmanaged = count_unmanaged_gpu_procs(&server_services, &st);
+
+    let llm = state.main_conf().llm.clone();
+    let prompt = ai::compat_check_prompt(&server, &st, &target, COMPAT_KB);
+    let mut ai_used = false;
+    let mut verdict: Value = Value::Null;
+    if llm.enabled {
+        if let Ok(Ok(raw)) =
+            tokio::time::timeout(Duration::from_secs(llm.timeout_secs), ai::ask_json(&llm, &prompt))
+                .await
+        {
+            let parsed = ai::unwrap_llm_json(&raw);
+            if parsed.get("verdict").and_then(|x| x.as_str()).is_some() {
+                verdict = parsed;
+                ai_used = true;
+            }
+        }
+    }
+    let rule = rule_compat_check(&st, &target, unmanaged);
+    if !ai_used {
+        verdict = rule;
+    } else {
+        // 规则引擎对 block 一票否决（防 LLM 幻觉放行）；缺失字段用规则值补齐
+        if rule.get("verdict").and_then(|x| x.as_str()) == Some("block")
+            && verdict.get("verdict").and_then(|x| x.as_str()) != Some("block")
+        {
+            verdict["verdict"] = json!("block");
+            verdict["reasons"] = rule["reasons"].clone();
+        }
+        for key in ["min_required_driver", "max_compatible", "required_cuda"] {
+            if verdict
+                .get(key)
+                .and_then(|x| x.as_str())
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
+                verdict[key] = rule[key].clone();
+            }
+        }
+    }
+    state.audit.record(
+        user,
+        "driver_compat_check",
+        &format!("{}:{} → {}", server.name, server.host, target),
+        &format!(
+            "ai={} verdict={}",
+            ai_used,
+            verdict.get("verdict").and_then(|x| x.as_str()).unwrap_or("?")
+        ),
+        ip,
+    );
+    json(
+        session,
+        200,
+        &json!({"ok": true, "data": {
+            "server_id": p.server_id,
+            "target_driver": target,
+            "current_driver": st.driver_version,
+            "current_cuda": st.cuda_version,
+            "ai_used": ai_used,
+            "unmanaged_gpu_procs": unmanaged,
+            "verdict": verdict,
+        }}),
+    )
+    .await
+}
+
+/// GET /api/driver-matrix/kb — 返回驱动兼容知识库原文（前端展示来源与版本）。
+async fn route_compat_kb(session: &mut Session, _state: &Arc<AppState>) {
+    let v: Value = serde_json::from_str(COMPAT_KB).unwrap_or(Value::Null);
+    json(session, 200, &json!({"ok": true, "data": v})).await
+}
+
+// ---------------------------------------------------------------------------
+// Agent 操作助手：自然语言 → 受限动作序列（LLM 生成 + 规则兜底）→ 逐步执行
+// ---------------------------------------------------------------------------
+
+const AGENT_MAX_STEPS: usize = 10;
+const AGENT_ACTIONS: [&str; 5] =
+    ["stop_service", "start_service", "update_service", "upgrade_driver", "wait"];
+
+#[derive(Deserialize, Default)]
+pub struct AgentPlanPayload {
+    #[serde(default)]
+    pub server_id: u64,
+    #[serde(default)]
+    pub prompt: String,
+}
+
+#[derive(Deserialize, Default)]
+pub struct AgentExecPayload {
+    #[serde(default)]
+    pub task_id: String,
+}
+
+fn agent_task_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("ag-{nanos:x}")
+}
+
+/// 从文本中提取第一个三段式驱动版本号（用于规则兜底）。
+fn find_driver_ver_in(text: &str) -> Option<String> {
+    let c: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    while i + 3 < c.len() {
+        if c[i].is_ascii_digit() && c[i + 1].is_ascii_digit() && c[i + 2].is_ascii_digit()
+            && c[i + 3] == '.'
+        {
+            let mut j = i + 4;
+            let s = j;
+            while j < c.len() && c[j].is_ascii_digit() {
+                j += 1;
+            }
+            if (1..=3).contains(&(j - s)) && c.get(j) == Some(&'.') {
+                let t = j + 1;
+                let mut k = t;
+                while k < c.len() && c[k].is_ascii_digit() {
+                    k += 1;
+                }
+                if (1..=3).contains(&(k - t)) {
+                    let ver = format!(
+                        "{}.{}.{}",
+                        c[i..i + 3].iter().collect::<String>(),
+                        c[s..j].iter().collect::<String>(),
+                        c[t..k].iter().collect::<String>()
+                    );
+                    if valid_driver_ver(&ver) {
+                        return Some(ver);
+                    }
+                }
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// 规则兜底计划：仅支持「升级到 X.YY.ZZ」型诉求（LLM 不可用时的安全降级）。
+fn rule_agent_plan(st: &ServerStatus, prompt: &str, svcs: &[&ServiceConf]) -> Result<(Vec<AgentStep>, String), String> {
+    if !prompt.contains("升级") && !prompt.to_ascii_lowercase().contains("upgrade") {
+        return Err("LLM 不可用，规则兜底暂只支持「升级驱动到指定版本号」类诉求".into());
+    }
+    let Some(target) = find_driver_ver_in(prompt) else {
+        return Err("LLM 不可用，且未能从诉求中识别出目标驱动版本号（如 590.48.01）".into());
+    };
+    if !st.driver_version.is_empty() && st.driver_version == target {
+        return Err(format!("当前驱动已是 {target}，无需升级")).into();
+    }
+    let running: Vec<&ServiceConf> = svcs
+        .iter()
+        .filter(|s| s.status == ServiceStatus::Running)
+        .copied()
+        .collect();
+    let mut steps = Vec::new();
+    for sv in &running {
+        steps.push(AgentStep {
+            idx: 0,
+            action: "stop_service".into(),
+            params: json!({"service_id": sv.id}),
+            description: format!("停止在跑服务 {}", sv.name),
+            status: "pending".into(),
+            log: String::new(),
+        });
+    }
+    steps.push(AgentStep {
+        idx: 0,
+        action: "upgrade_driver".into(),
+        params: json!({"target_driver": target, "auto_reboot": false}),
+        description: format!("升级驱动至 {target}（DKMS 原地安装，先卸旧模块）"),
+        status: "pending".into(),
+        log: String::new(),
+    });
+    steps.push(AgentStep {
+        idx: 0,
+        action: "wait".into(),
+        params: json!({"seconds": 120}),
+        description: "等待驱动模块加载与机器就绪".into(),
+        status: "pending".into(),
+        log: String::new(),
+    });
+    for sv in &running {
+        steps.push(AgentStep {
+            idx: 0,
+            action: "start_service".into(),
+            params: json!({"service_id": sv.id}),
+            description: format!("重新启动服务 {}", sv.name),
+            status: "pending".into(),
+            log: String::new(),
+        });
+    }
+    Ok((
+        steps,
+        format!("规则兜底计划：停止 {} 个在跑服务 → 升级驱动至 {target} → 等待 → 恢复服务", running.len()),
+    ))
+}
+
+/// 校验并规范化 LLM 生成的步骤序列（动作白名单 / service_id 存在性 / 参数范围）。
+fn validate_agent_steps(steps: &mut Vec<AgentStep>, state: &Arc<AppState>, server_id: u64) -> Result<(), String> {
+    if steps.is_empty() {
+        return Err("计划为空：LLM 判断该诉求无法安全执行（详见说明）".into());
+    }
+    if steps.len() > AGENT_MAX_STEPS {
+        return Err(format!("计划共 {} 步，超过上限 {AGENT_MAX_STEPS} 步", steps.len()));
+    }
+    let services = state.services.load().services.clone();
+    for (i, s) in steps.iter_mut().enumerate() {
+        s.idx = (i as u32) + 1;
+        let action = s.action.trim().to_ascii_lowercase();
+        if !AGENT_ACTIONS.contains(&action.as_str()) {
+            return Err(format!("第 {} 步动作「{}」不在动作白名单内", i + 1, s.action));
+        }
+        s.action = action;
+        let require_service = |params: &Value, step_no: usize| -> Result<u64, String> {
+            let id = params
+                .get("service_id")
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| format!("第 {step_no} 步缺少 service_id 或不是整数"))?;
+            if !services.iter().any(|sv| sv.id == id && sv.server_id == server_id) {
+                return Err(format!(
+                    "第 {step_no} 步引用的服务 id {id} 不存在或不属于该机器"
+                ));
+            }
+            Ok(id)
+        };
+        match s.action.as_str() {
+            "stop_service" | "start_service" => {
+                require_service(&s.params, i + 1)?;
+            }
+            "update_service" => {
+                require_service(&s.params, i + 1)?;
+                let mp = s
+                    .params
+                    .get("model_path")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if mp.is_empty() {
+                    return Err(format!("第 {} 步缺少 model_path", i + 1));
+                }
+            }
+            "upgrade_driver" => {
+                let t = s
+                    .params
+                    .get("target_driver")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !valid_driver_ver(&t) {
+                    return Err(format!("第 {} 步 target_driver 格式不正确：{t}", i + 1));
+                }
+                let ar = s
+                    .params
+                    .get("auto_reboot")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                s.params = json!({"target_driver": t, "auto_reboot": ar});
+            }
+            "wait" => {
+                let sec = s.params.get("seconds").and_then(|x| x.as_u64());
+                match sec {
+                    Some(n) if (1..=600).contains(&n) => {
+                        s.params = json!({"seconds": n});
+                    }
+                    _ => return Err(format!("第 {} 步 wait.seconds 必须是 1..=600 的整数", i + 1)),
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// POST /api/driver-matrix/agent-plan {server_id, prompt}
+async fn route_agent_plan(session: &mut Session, state: &Arc<AppState>, user: &str, ip: &str) {
+    let v = parse_body(session).await.unwrap_or(Value::Null);
+    let p: AgentPlanPayload = match serde_json::from_value(v) {
+        Ok(x) => x,
+        Err(_) => return fail(session, 400, "参数错误：需要 server_id 与 prompt").await,
+    };
+    let prompt = p.prompt.trim().to_string();
+    if prompt.is_empty() {
+        return fail(session, 400, "prompt 不能为空").await;
+    }
+    let Some(server) = state.find_server(p.server_id) else {
+        return fail(session, 404, "服务器不存在").await;
+    };
+    if !server.enabled {
+        return fail(session, 409, "该服务器已停用").await;
+    }
+    let Some(st) = state.status_of(p.server_id) else {
+        return fail(session, 409, "该机器状态未知，请先在服务器列表刷新").await;
+    };
+    if !st.online {
+        return fail(session, 409, &format!("机器离线（{}）", st.error)).await;
+    }
+    let services_all = state.services.load();
+    let svcs: Vec<&ServiceConf> = services_all
+        .services
+        .iter()
+        .filter(|s| s.server_id == p.server_id)
+        .collect();
+
+    let llm = state.main_conf().llm.clone();
+    let plan_prompt = ai::agent_plan_prompt(&server, &st, &svcs, &prompt, COMPAT_KB);
+    let mut ai_used = false;
+    let mut plan_v: Value = Value::Null;
+    if llm.enabled {
+        if let Ok(Ok(raw)) =
+            tokio::time::timeout(Duration::from_secs(llm.timeout_secs), ai::ask_json(&llm, &plan_prompt))
+                .await
+        {
+            let parsed = ai::unwrap_llm_json(&raw);
+            if parsed.get("steps").and_then(|x| x.as_array()).is_some() {
+                plan_v = parsed;
+                ai_used = true;
+            }
+        }
+    }
+    let mut steps: Vec<AgentStep> = plan_v
+        .get("steps")
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let action = s.get("action")?.as_str()?;
+                    Some(AgentStep {
+                        idx: 0,
+                        action: action.to_string(),
+                        params: s.get("params").cloned().unwrap_or(json!({})),
+                        description: s
+                            .get("description")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        status: "pending".into(),
+                        log: String::new(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut summary = plan_v
+        .get("summary")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if !ai_used {
+        match rule_agent_plan(&st, &prompt, &svcs) {
+            Ok((rs, rsum)) => {
+                steps = rs;
+                summary = rsum;
+            }
+            Err(e) => return fail(session, 502, &e).await,
+        }
+    } else if summary.is_empty() {
+        summary = "LLM 未给出说明".to_string();
+    }
+
+    if let Err(e) = validate_agent_steps(&mut steps, state, p.server_id) {
+        return fail(session, 422, &e).await;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let id = agent_task_id();
+    let task = AgentTask {
+        id: id.clone(),
+        server_id: p.server_id,
+        prompt: prompt.clone(),
+        summary: summary.clone(),
+        steps: steps.clone(),
+        phase: "running".to_string(),
+        started_at: now,
+        finished_at: 0,
+        error: None,
+    };
+    if let Ok(mut m) = state.agent_tasks.lock() {
+        m.insert(id.clone(), task);
+    }
+    state.audit.record(
+        user,
+        "agent_plan",
+        &format!("{}:{}: {}", server.name, server.host, prompt.chars().take(80).collect::<String>()),
+        &format!("steps={} ai_used={}", steps.len(), ai_used),
+        ip,
+    );
+    json(
+        session,
+        200,
+        &json!({"ok": true, "data": {"task_id": id, "ai_used": ai_used, "summary": summary, "steps": steps}}),
+    )
+    .await
+}
+
+/// 执行单个 Agent 步骤。
+async fn agent_execute_step(
+    state: &Arc<AppState>,
+    user: &str,
+    ip: &str,
+    server_id: u64,
+    step: &AgentStep,
+) -> Result<String, String> {
+    match step.action.as_str() {
+        "wait" => {
+            let secs = step.params.get("seconds").and_then(|x| x.as_u64()).unwrap_or(30).min(600);
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+            Ok(format!("已等待 {secs} 秒"))
+        }
+        "stop_service" => {
+            let sid = step
+                .params
+                .get("service_id")
+                .and_then(|x| x.as_u64())
+                .ok_or("缺少 service_id")?;
+            let svc = state.find_service(sid).ok_or_else(|| format!("服务 {sid} 不存在"))?;
+            if svc.server_id != server_id {
+                return Err(format!("服务 {sid} 不属于该机器"));
+            }
+            let (out, _exit) = stop_service_core(state, user, ip, &svc).await?;
+            Ok(if out.trim().is_empty() {
+                "停止命令已执行".to_string()
+            } else {
+                out
+            })
+        }
+        "start_service" => {
+            let sid = step
+                .params
+                .get("service_id")
+                .and_then(|x| x.as_u64())
+                .ok_or("缺少 service_id")?;
+            let svc = state.find_service(sid).ok_or_else(|| format!("服务 {sid} 不存在"))?;
+            if svc.server_id != server_id {
+                return Err(format!("服务 {sid} 不属于该机器"));
+            }
+            if service_alive(&svc, state).await {
+                return Ok("服务已在运行，无需启动".to_string());
+            }
+            let (_pid, gpus, _cmd, out, exit) =
+                start_service_core(state, user, ip, &svc, server_id)
+                    .await
+                    .map_err(|(_code, msg)| msg)?;
+            Ok(format!(
+                "启动命令已执行（exit={exit}，GPU {gpus:?}）：{}",
+                out.chars().take(200).collect::<String>()
+            ))
+        }
+        "update_service" => {
+            let sid = step
+                .params
+                .get("service_id")
+                .and_then(|x| x.as_u64())
+                .ok_or("缺少 service_id")?;
+            let mp = step
+                .params
+                .get("model_path")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let server = state.find_server(server_id).ok_or("服务器不存在")?;
+            let probe = ssh_exec(
+                &server.host,
+                server.port,
+                &server.user,
+                &server.password,
+                &format!("test -d {mp} && echo vgs_ok"),
+                Duration::from_secs(15),
+            )
+            .await?;
+            if !probe.stdout.contains("vgs_ok") {
+                return Err(format!("模型路径在目标机不存在：{mp}"));
+            }
+            let mut services = state.services.load().as_ref().clone();
+            if let Some(s) = services.services.iter_mut().find(|x| x.id == sid) {
+                s.model_path = mp.clone();
+            }
+            if let Err(e) = services.save(&state.main_conf().services_path()) {
+                return Err(e);
+            }
+            state.services.store(Arc::new(services));
+            state.audit.record(user, "agent_update_service", &format!("服务 {sid} → {mp}"), "Agent 更新模型路径（重启后生效）", ip);
+            Ok(format!("模型路径已更新为 {mp}（重启服务后生效）"))
+        }
+        "upgrade_driver" => {
+            let target = step
+                .params
+                .get("target_driver")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let auto_reboot = step
+                .params
+                .get("auto_reboot")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
+            let server = state.find_server(server_id).ok_or("服务器不存在")?;
+            let st = state.status_of(server_id).ok_or("机器状态未知")?;
+            if !st.online {
+                return Err(format!("机器离线（{}），不能升级", st.error));
+            }
+            if !st.driver_version.is_empty() && st.driver_version == target {
+                return Ok(format!("当前驱动已是 {target}，无需升级"));
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let task = DrvTask {
+                server_id,
+                name: server.name.clone(),
+                host: server.host.clone(),
+                current_driver: st.driver_version.clone(),
+                target_driver: target.clone(),
+                target_cuda: String::new(),
+                phase: "preparing".to_string(),
+                started_at: now,
+                auto_reboot,
+                stopped_services: Vec::new(),
+                log: Vec::new(),
+                remote_log: String::new(),
+                error: None,
+                ai_verdict: None,
+                restarted: Vec::new(),
+                final_driver: String::new(),
+            };
+            if let Ok(mut m) = state.drv_tasks.lock() {
+                m.insert(server_id, task);
+            }
+            state.audit.record(user, "agent_driver_upgrade", &format!("{}:{} → {target}", server.name, server.host), "Agent 发起驱动升级（stop_services=false）", ip);
+            tokio::spawn(drv_pipeline(
+                state.clone(),
+                user.to_string(),
+                ip.to_string(),
+                server_id,
+                target.clone(),
+                false,
+                auto_reboot,
+            ));
+            // 轮询驱动任务直至结束（上限 40 分钟）
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(40 * 60);
+            loop {
+                let t = state.drv_tasks.lock().ok().and_then(|m| m.get(&server_id).cloned());
+                match t {
+                    Some(t) if t.phase == "done" => {
+                        return Ok(format!(
+                            "驱动升级完成：{} → {}",
+                            t.current_driver,
+                            if t.final_driver.is_empty() {
+                                t.target_driver
+                            } else {
+                                t.final_driver
+                            }
+                        ))
+                    }
+                    Some(t) if t.phase == "fail" => {
+                        return Err(t
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| format!("驱动升级失败（driver={}），详见升级进度页", t.final_driver)))
+                    }
+                    _ => {}
+                }
+                if tokio::time::Instant::now() > deadline {
+                    return Err("等待驱动升级任务超时（40 分钟），请到升级进度页查看实际状态".into());
+                }
+                tokio::time::sleep(Duration::from_secs(15)).await;
+            }
+        }
+        other => Err(format!("未知动作 {other}")),
+    }
+}
+
+fn agent_update_step(state: &Arc<AppState>, task_id: &str, idx: u32, status: &str, log: &str) {
+    if let Ok(mut m) = state.agent_tasks.lock() {
+        if let Some(t) = m.get_mut(task_id) {
+            if let Some(s) = t.steps.iter_mut().find(|s| s.idx == idx) {
+                s.status = status.to_string();
+                if !log.is_empty() {
+                    if s.log.is_empty() {
+                        s.log = log.to_string();
+                    } else {
+                        s.log.push('\n');
+                        s.log.push_str(log);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn agent_finish(state: &Arc<AppState>, task_id: &str, phase: &str, error: Option<String>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if let Ok(mut m) = state.agent_tasks.lock() {
+        if let Some(t) = m.get_mut(task_id) {
+            t.phase = phase.to_string();
+            t.finished_at = now;
+            t.error = error;
+        }
+    }
+}
+
+/// Agent 任务执行循环（逐步执行，任一步失败即终止）。
+async fn agent_pipeline(state: Arc<AppState>, user: String, ip: String, task_id: String) {
+    let (server_id, steps) = {
+        let m = match state.agent_tasks.lock().ok() {
+            Some(m) => m,
+            None => return,
+        };
+        match m.get(&task_id).cloned() {
+            Some(t) if t.phase == "running" => (t.server_id, t.steps),
+            _ => return,
+        }
+    };
+    let server_name = state.find_server(server_id).map(|s| s.name).unwrap_or_default();
+    for step in &steps {
+        agent_update_step(&state, &task_id, step.idx, "running", "");
+        match agent_execute_step(&state, &user, &ip, server_id, step).await {
+            Ok(out) => {
+                agent_update_step(&state, &task_id, step.idx, "done", &out);
+                state.audit.record(
+                    &user,
+                    "agent_step_done",
+                    &format!("{server_name} 步骤{} {} {}", step.idx, step.action, step.description),
+                    out.trim(),
+                    &ip,
+                );
+            }
+            Err(e) => {
+                agent_update_step(&state, &task_id, step.idx, "fail", &e);
+                agent_finish(
+                    &state,
+                    &task_id,
+                    "fail",
+                    Some(format!("步骤{}（{} {}）执行失败：{}", step.idx, step.action, step.description, e)),
+                );
+                return;
+            }
+        }
+    }
+    agent_finish(&state, &task_id, "done", None);
+    state.audit.record(&user, "agent_task_done", &format!("{server_name} 全部步骤完成"), "", &ip);
+}
+
+/// POST /api/driver-matrix/agent-execute {task_id}
+async fn route_agent_execute(session: &mut Session, state: &Arc<AppState>, user: &str, ip: &str) {
+    let v = parse_body(session).await.unwrap_or(Value::Null);
+    let p: AgentExecPayload = match serde_json::from_value(v) {
+        Ok(x) => x,
+        Err(_) => return fail(session, 400, "参数错误：需要 task_id").await,
+    };
+    let task_id = p.task_id.trim().to_string();
+    if task_id.is_empty() {
+        return fail(session, 400, "task_id 不能为空").await;
+    }
+    let task = state
+        .agent_tasks
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&task_id).cloned());
+    let Some(task) = task else {
+        return fail(session, 404, "任务不存在或已随进程重启丢失，请重新生成计划").await;
+    };
+    if task.phase != "running" {
+        return fail(session, 409, &format!("任务已结束（{}），不能重复执行", task.phase)).await;
+    }
+    if state
+        .drv_tasks
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&task.server_id).and_then(|t| t.active().then_some(())))
+        .is_some()
+    {
+        return fail(session, 409, "该机器已有驱动升级任务进行中，请等待其结束").await;
+    }
+    if state
+        .agent_tasks
+        .lock()
+        .ok()
+        .map(|m| {
+            m.values()
+                .any(|t| t.server_id == task.server_id && t.phase == "running" && t.id != task_id)
+        })
+        .unwrap_or(false)
+    {
+        return fail(session, 409, "该机器已有 Agent 任务在执行中").await;
+    }
+    tokio::spawn(agent_pipeline(
+        state.clone(),
+        user.to_string(),
+        ip.to_string(),
+        task_id.clone(),
+    ));
+    json(
+        session,
+        202,
+        &json!({"ok": true, "data": {"task_id": task_id, "phase": "running"}}),
+    )
+    .await
+}
+
+/// GET /api/driver-matrix/agent-status
+async fn route_agent_status(session: &mut Session, state: &Arc<AppState>) {
+    let rows: Vec<Value> = state
+        .agent_tasks
+        .lock()
+        .ok()
+        .map(|m| {
+            m.values()
+                .map(|t| {
+                    json!({
+                        "id": t.id,
+                        "server_id": t.server_id,
+                        "prompt": t.prompt,
+                        "summary": t.summary,
+                        "phase": t.phase,
+                        "error": t.error,
+                        "steps": t.steps,
+                        "started_at": t.started_at,
+                        "finished_at": t.finished_at,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json(session, 200, &json!({"ok": true, "data": rows})).await
 }
 
 /// 生成目标机安装脚本：写状态文件 /tmp/vgs_drvup_{id}.status（pending/installing/ok/fail/reboot），
@@ -1783,9 +2772,10 @@ fn parse_deploy_type(s: &str) -> Option<DeployType> {
 }
 
 /// 服务进程真实存活判定：
-/// 1) GPU 进程 cmdline 含 model_path（vllm/sglang 等 GPU 服务，本地零成本）；
-/// 2) 否则查 /proc/{pid} 存在性（不限进程属主 —— 集群服务多为 root/其他用户运行，kill -0 会 EPERM）；
-/// 3) docker 类型检查容器是否存在。
+/// 1) docker 类型按容器名判定（平台自管 vgs_{id} / 纳管外部容器 container_name）；
+/// 2) GPU 进程 cmdline 含 model_path（vllm/sglang 等 GPU 服务，本地零成本）；
+/// 3) stop_pattern 命中缓存进程 cmdline（router 等无模型路径的纳管服务）；
+/// 4) 否则查 /proc/{pid} 存在性（不限进程属主 —— 集群服务多为 root/其他用户运行，kill -0 会 EPERM）。
 /// SSH 校验失败（机器不可达）一律按未存活处理，避免误报 running。
 async fn service_alive(svc: &ServiceConf, state: &Arc<AppState>) -> bool {
     let servers = state.servers.load();
@@ -1793,10 +2783,20 @@ async fn service_alive(svc: &ServiceConf, state: &Arc<AppState>) -> bool {
         return false;
     };
     let timeout = Duration::from_secs(15);
-    // 自管容器（平台 docker run 启动，容器名 vgs_{id}）按容器名判定；
-    // 智能检测纳管的外部容器 stop_pattern 非空，走下面的 cmdline/pid 判定。
-    if svc.deploy_type == DeployType::Docker && svc.stop_pattern.trim().is_empty() {
-        let cmd = format!("docker ps -q --filter name=^vgs_{}$", svc.id);
+    // 容器判活：纳管外部容器按 container_name，平台自管容器按 vgs_{id}
+    let docker_name = if svc.deploy_type == DeployType::Docker {
+        if !svc.container_name.trim().is_empty() {
+            Some(svc.container_name.trim().to_string())
+        } else if svc.stop_pattern.trim().is_empty() {
+            Some(format!("vgs_{}", svc.id))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(name) = docker_name {
+        let cmd = format!("docker ps -q --filter name=^{name}$");
         return match ssh_exec(&server.host, server.port, &server.user, &server.password, &cmd, timeout).await {
             Ok(r) => r.exit_code == 0 && !r.stdout.trim().is_empty(),
             Err(_) => false,
@@ -1810,6 +2810,17 @@ async fn service_alive(svc: &ServiceConf, state: &Arc<AppState>) -> bool {
             .unwrap_or(false)
     {
         return true;
+    }
+    // 无模型路径的纳管服务（如 sglang-router）：stop_pattern 命中缓存进程 cmdline 即存活
+    if svc.model_path.is_empty() && !svc.stop_pattern.trim().is_empty() {
+        let sp = svc.stop_pattern.trim().to_string();
+        if statuses
+            .get(&svc.server_id)
+            .map(|x| x.procs.iter().any(|p| p.name.contains(&sp) || p.cmdline.contains(&sp)))
+            .unwrap_or(false)
+        {
+            return true;
+        }
     }
     // 无模型路径的纳管服务（智能检测注册，如 EngineCore / 容器内服务）：
     // 直接用采集缓存里的 GPU 进程 pid 判活；缓存缺失或进程不在 GPU 列表时
@@ -1855,6 +2866,7 @@ async fn service_view(svc: &ServiceConf, state: &Arc<AppState>) -> Value {
         "extra_args": svc.extra_args,
         "docker_image": svc.docker_image,
         "docker_args": svc.docker_args,
+        "container_name": svc.container_name,
         "python_cmd": svc.python_cmd,
         "stop_pattern": svc.stop_pattern,
         "server_id": svc.server_id,
@@ -1983,6 +2995,7 @@ async fn route_service_create(
         extra_args: p.extra_args.unwrap_or_default(),
         docker_image: p.docker_image.unwrap_or_default(),
         docker_args: p.docker_args.unwrap_or_default(),
+        container_name: String::new(),
         python_cmd: p.python_cmd.unwrap_or_default(),
         stop_pattern: p.stop_pattern.unwrap_or_default(),
         status: ServiceStatus::Stopped,
@@ -2107,10 +3120,18 @@ async fn start_service_core(
     if !st.online {
         return Err((502, format!("目标机器采集失败: {}", st.error)));
     }
-    if st.gpus.is_empty() {
-        return Err((502, "目标机器没有可用的 GPU".to_string()));
+    // 纳管的外部容器自带 GPU 绑定，不需要平台选卡
+    let has_container = !svc.container_name.trim().is_empty();
+    if !has_container {
+        if st.gpus.is_empty() {
+            return Err((502, "目标机器没有可用的 GPU".to_string()));
+        }
     }
-    let gpus = deploy::pick_gpus(&st, svc.tp.max(1), &[]).ok_or_else(|| (409, "空闲 GPU 卡数量不足".to_string()))?;
+    let gpus = if has_container {
+        Vec::new()
+    } else {
+        deploy::pick_gpus(&st, svc.tp.max(1), &[]).ok_or_else(|| (409, "空闲 GPU 卡数量不足".to_string()))?
+    };
     let cmd = deploy::build_start_cmd(svc, &gpus);
     let timeout = Duration::from_secs(60);
     match ssh_exec(
@@ -2125,7 +3146,7 @@ async fn start_service_core(
     {
         Ok(out) => {
             let out_trim = out.stdout.trim().to_string();
-            let pid: Option<u32> = if svc.deploy_type == DeployType::Docker {
+            let pid: Option<u32> = if svc.deploy_type == DeployType::Docker || has_container {
                 None
             } else {
                 out_trim.lines().rev().find_map(|l| l.trim().parse::<u32>().ok())
@@ -2158,19 +3179,21 @@ async fn start_service_core(
     }
 }
 
-async fn route_stop(
-    session: &mut Session,
+/// 停止服务的核心逻辑（HTTP 端点与 Agent 步骤执行共用）：
+/// SSH 执行停止命令 → 服务标记 Stopped 并清空 pid → 持久化 + 审计。
+/// 返回 (命令输出, 退出码)。
+async fn stop_service_core(
     state: &Arc<AppState>,
     user: &str,
     ip: &str,
     svc: &ServiceConf,
-) {
-    let Some(server) = state.find_server(svc.server_id) else {
-        return fail(session, 404, "服务所在服务器不存在").await;
-    };
+) -> Result<(String, i32), String> {
+    let server = state
+        .find_server(svc.server_id)
+        .ok_or_else(|| "服务所在服务器不存在".to_string())?;
     let cmd = deploy::build_stop_cmd(svc);
     let timeout = Duration::from_secs(30);
-    match ssh_exec(
+    let out = ssh_exec(
         &server.host,
         server.port,
         &server.user,
@@ -2179,28 +3202,43 @@ async fn route_stop(
         timeout,
     )
     .await
-    {
-        Ok(out) => {
-            let mut services = state.services.load().as_ref().clone();
-            if let Some(s) = services.services.iter_mut().find(|x| x.id == svc.id) {
-                s.status = ServiceStatus::Stopped;
-                s.pid = None;
-            }
-            if let Err(e) = services.save(&state.main_conf().services_path()) {
-                return fail(session, 500, &e).await;
-            }
-            state.services.store(Arc::new(services));
-            state
-                .audit
-                .record(user, "stop_service", &format!("{}@{}", svc.name, server.host), out.stdout.trim(), ip);
-            ok(session, &json!({"output": out.stdout.trim(), "exit_code": out.exit_code})).await
-        }
-        Err(e) => {
-            state
-                .audit
-                .record(user, "stop_service_failed", &format!("{}@{}", svc.name, server.host), &e, ip);
-            fail(session, 502, &e).await
-        }
+    .map_err(|e| {
+        state.audit.record(
+            user,
+            "stop_service_failed",
+            &format!("{}@{}", svc.name, server.host),
+            &e,
+            ip,
+        );
+        e
+    })?;
+    let mut services = state.services.load().as_ref().clone();
+    if let Some(s) = services.services.iter_mut().find(|x| x.id == svc.id) {
+        s.status = ServiceStatus::Stopped;
+        s.pid = None;
+    }
+    services.save(&state.main_conf().services_path())?;
+    state.services.store(Arc::new(services));
+    state.audit.record(
+        user,
+        "stop_service",
+        &format!("{}@{}", svc.name, server.host),
+        out.stdout.trim(),
+        ip,
+    );
+    Ok((out.stdout.trim().to_string(), out.exit_code))
+}
+
+async fn route_stop(
+    session: &mut Session,
+    state: &Arc<AppState>,
+    user: &str,
+    ip: &str,
+    svc: &ServiceConf,
+) {
+    match stop_service_core(state, user, ip, svc).await {
+        Ok((out, exit_code)) => ok(session, &json!({"output": out, "exit_code": exit_code})).await,
+        Err(e) => fail(session, 502, &e).await,
     }
 }
 
@@ -2779,6 +3817,9 @@ struct AdoptPayload {
     extra_args: Option<String>,
     cmdline: Option<String>,
     model_name: Option<String>,
+    /// 纳管的外部 docker 容器名（智能检测发现时记录，停止时精确 stop）
+    container_name: Option<String>,
+    container_image: Option<String>,
 }
 
 async fn routes_discover(
@@ -2892,16 +3933,9 @@ async fn route_discover_scan(
         }
     }
     // 按引擎优先级排序（推理引擎在前，其次 python，最后 other）
-    let rank = |e: &str| -> u8 {
-        match e {
-            "vllm" | "sglang" | "triton" | "xinference" | "paddlex" | "funasr" | "ollama" => 0,
-            "python" => 1,
-            _ => 2,
-        }
-    };
     items.sort_by(|a, b| {
-        rank(&a.engine)
-            .cmp(&rank(&b.engine))
+        discover::engine_rank(&a.engine)
+            .cmp(&discover::engine_rank(&b.engine))
             .then(a.server_name.cmp(&b.server_name))
             .then(a.pid.cmp(&b.pid))
     });
@@ -2946,21 +3980,35 @@ async fn route_discover_adopt(
         Some(v) if !v.is_empty() => v.clone(),
         _ => p.pid.into_iter().collect(),
     };
-    // 查重：同机器同模型路径（互为前缀视为同一模型），或同机器且 pid 在检测树内
-    // （即使已注册服务的 pid 是该进程组的子/父进程，也视为重复，避免重复纳管）
-    let dup = services
-        .services
-        .iter()
-        .any(|s| {
-            s.server_id == server_id
-                && (if !model_path.is_empty() && !s.model_path.is_empty() {
-                    s.model_path == model_path
-                        || s.model_path.starts_with(&model_path)
-                        || model_path.starts_with(&s.model_path)
-                } else {
-                    pids.iter().any(|x| s.pid == Some(*x))
-                })
-        });
+    // 查重：同机器且（pid 在检测树内 / 同容器 / 同模型路径+端口冲突）视为重复。
+    // 同模型多实例（不同容器、不同端口）允许分别纳管。
+    let det_cname = p.container_name.as_deref().unwrap_or("").trim().to_string();
+    let det_port = p.port.unwrap_or(0);
+    let dup = services.services.iter().any(|s| {
+        if s.server_id != server_id {
+            return false;
+        }
+        if pids.iter().any(|x| s.pid == Some(*x)) {
+            return true;
+        }
+        let s_cname = s.container_name.trim();
+        if !s_cname.is_empty() && !det_cname.is_empty() && s_cname == det_cname {
+            return true;
+        }
+        if !model_path.is_empty() && !s.model_path.is_empty()
+            && (s.model_path == model_path
+                || s.model_path.starts_with(&model_path)
+                || model_path.starts_with(&s.model_path))
+        {
+            // 同模型：仅当端口相同（或任一侧未知=0）才视为同一服务
+            match (det_port, s.port) {
+                (a, b) if a != 0 && b != 0 => a == b,
+                _ => true,
+            }
+        } else {
+            false
+        }
+    });
     if dup {
         return fail(
             session,
@@ -2974,6 +4022,7 @@ async fn route_discover_adopt(
     let deploy_type = match engine.as_str() {
         "vllm" => DeployType::Vllm,
         "sglang" => DeployType::Sglang,
+        "sglang-router" => DeployType::Docker,
         "triton" => DeployType::Docker,
         _ => DeployType::Python,
     };
@@ -2998,6 +4047,15 @@ async fn route_discover_adopt(
             .model_name
             .clone()
             .filter(|x| !x.trim().is_empty())
+            .unwrap_or_default();
+    }
+    if name.is_empty() {
+        // 容器纳管（含 sglang-router 等无模型无卡的路由服务）：用容器名
+        name = p
+            .container_name
+            .clone()
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
             .unwrap_or_default();
     }
     if name.is_empty() {
@@ -3029,8 +4087,13 @@ async fn route_discover_adopt(
         port: p.port.unwrap_or(8000),
         tp: p.tp.unwrap_or(1).max(1),
         extra_args: p.extra_args.clone().unwrap_or_default(),
-        docker_image: String::new(),
+        docker_image: p.container_image.clone().unwrap_or_default(),
         docker_args: String::new(),
+        container_name: p
+            .container_name
+            .clone()
+            .map(|x| x.trim().to_string())
+            .unwrap_or_default(),
         python_cmd: if matches!(deploy_type, DeployType::Python) {
             cmdline.clone()
         } else {
