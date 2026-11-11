@@ -327,12 +327,9 @@ fn base_name(path: &str) -> &str {
 fn container_args_port(args: &str) -> Option<u16> {
     let idx = args.find("--port")?;
     let rest = &args[idx + "--port".len()..];
-    if rest.starts_with('=') {
-        let v = rest[1..].trim_start_matches('"');
-        return v.split(['"', ',', '}']).next()?.parse().ok();
-    }
-    let v = rest.trim_start_matches(',').trim_start_matches('"');
-    v.split(['"', ',', '}']).next()?.parse().ok()
+    // 兼容 `--port 30002` / `--port=30002` / JSON `["--port","30002"]`（其后为 `","30002"`）
+    let v = rest.trim_start_matches(|c: char| matches!(c, '=' | '"' | ',' | ' ' | '\t'));
+    v.split(['"', ',', '}', ' ', '\t']).next()?.trim().parse().ok()
 }
 
 /// 取 `--flag value` 或 `--flag=value` 形式的参数值。
@@ -994,4 +991,137 @@ pub fn regex_escape(s: &str) -> String {
         out.push(c);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{container_args_port, detect, Container, DeepProc, DiscoverResult, RouterProc};
+    use crate::config::{ServerConf, ServiceConf};
+
+    /// node31 上 sglang-router（0.2.4）的真实启动参数：进程标题被改写为 sglang::router，
+    /// --port 只能从 docker inspect 的 Config.Cmd/Entrypoint JSON 中还原。
+    const ROUTER_ARGS: &str = r#"["--worker-urls","http://127.0.0.1:30000","http://127.0.0.1:30001","--host","0.0.0.0","--port","30002","--policy","cache_aware","--balance-abs-threshold","1","--balance-rel-threshold","1.1","--eviction-interval-secs","5","--request-timeout-secs","1800"] ["python3","-m","sglang_router.launch_router"]"#;
+
+    #[test]
+    fn router_port_from_json_args() {
+        assert_eq!(container_args_port(ROUTER_ARGS), Some(30002));
+    }
+
+    #[test]
+    fn router_port_space_and_eq_forms() {
+        assert_eq!(
+            container_args_port("--port 30000 --policy cache_aware"),
+            Some(30000)
+        );
+        assert_eq!(container_args_port("--port=30001"), Some(30001));
+    }
+
+    #[test]
+    fn router_port_missing() {
+        assert_eq!(container_args_port("--policy cache_aware --host 0.0.0.0"), None);
+        assert_eq!(container_args_port(""), None);
+    }
+
+    /// 回归（node31 实际场景）：
+    /// - inst1 30000 容器 qwen38-fp8-sglang = 已注册服务 20 → registered=true
+    /// - inst2 30001 容器 qwen38-fp8-sglang-2 同模型独立实例 → registered=false
+    /// - router 端口必须取容器启动参数里的 --port 30002，
+    ///   而不是 ss 监听列表里的第一个 29000（metrics/管理口）
+    #[test]
+    fn detect_multi_instance_and_router_port() {
+        let server = ServerConf {
+            id: 28,
+            name: "node31".into(),
+            host: "10.0.0.31".into(),
+            port: 22,
+            user: "u".into(),
+            password: String::new(),
+            notes: String::new(),
+            enabled: true,
+        };
+        let cid_a = "aaaaaaaaaa1111111111111111111111111111111111111111111111111111111";
+        let cid_b = "bbbbbbbbbb2222222222222222222222222222222222222222222222222222";
+        let cid_r = "cbdb95ad9e3e85a036c7627740cf9d547bfdd555e99798a40290ac9b2788c4a8";
+        let mk_cmd = |port: u16| {
+            format!(
+                "python3 -m sglang.launch_server --model-path /models/Qwen3.8-27B-FP8 --tp-size 4 --mem-fraction-static 0.72 --host 0.0.0.0 --port {port}"
+            )
+        };
+        let mut dr = DiscoverResult::default();
+        dr.procs.push(DeepProc {
+            pid: 546523,
+            name: "python3".into(),
+            gpus: vec![0, 1, 2, 3],
+            mem_mib: 83554,
+            cid: cid_a.into(),
+            ppid: 1,
+            cmdline: mk_cmd(30000),
+            parent_cmdline: String::new(),
+            root_cmdline: String::new(),
+            root_pid: 0,
+        });
+        dr.procs.push(DeepProc {
+            pid: 553188,
+            name: "python3".into(),
+            gpus: vec![4, 5, 6, 7],
+            mem_mib: 83900,
+            cid: cid_b.into(),
+            ppid: 1,
+            cmdline: mk_cmd(30001),
+            parent_cmdline: String::new(),
+            root_cmdline: String::new(),
+            root_pid: 0,
+        });
+        dr.containers.push(Container {
+            cid: cid_a[..12].into(),
+            name: "qwen38-fp8-sglang".into(),
+            image: "lmsysorg/sglang:v0.5.19-cu129".into(),
+            ports: Vec::new(),
+        });
+        dr.containers.push(Container {
+            cid: cid_b[..12].into(),
+            name: "qwen38-fp8-sglang-2".into(),
+            image: "lmsysorg/sglang:v0.5.19-cu129".into(),
+            ports: Vec::new(),
+        });
+        dr.containers.push(Container {
+            cid: cid_r[..12].into(),
+            name: "sgl-router".into(),
+            image: "lmsysorg/sglang-router:v0.2.4".into(),
+            ports: Vec::new(),
+        });
+        dr.routers.push(RouterProc {
+            pid: 2292274,
+            name: "sglang::router".into(),
+            ports: vec![29000, 30002],
+            mem_mib: 4328,
+            cid: cid_r.into(),
+            cmdline: "sglang::router".into(),
+            args: ROUTER_ARGS.into(),
+        });
+        let existing: Vec<ServiceConf> = serde_json::from_str(
+            r#"[{"id":20,"name":"Qwen3.8-27B-FP8","model_path":"/models/Qwen3.8-27B-FP8","server_id":28,"deploy_type":"sglang","port":30000,"tp":4,"container_name":"qwen38-fp8-sglang","status":"running","pid":2307514}]"#,
+        )
+        .unwrap();
+        let out = detect(&server, None, &dr, &existing);
+        assert_eq!(out.len(), 3, "两个 sglang 实例 + 一个 router: {out:#?}");
+
+        let inst1 = out.iter().find(|d| d.port == 30000).unwrap();
+        assert_eq!(inst1.container_name, "qwen38-fp8-sglang");
+        assert_eq!(inst1.model_path, "/models/Qwen3.8-27B-FP8");
+        assert!(inst1.registered, "服务 20 容器名匹配 → 已注册");
+
+        let inst2 = out.iter().find(|d| d.port == 30001).unwrap();
+        assert_eq!(inst2.container_name, "qwen38-fp8-sglang-2");
+        assert!(!inst2.registered, "不同容器的同模型独立实例 → 未注册");
+
+        let router = out.iter().find(|d| d.engine == "sglang-router").unwrap();
+        assert_eq!(
+            router.port, 30002,
+            "端口必须取容器启动参数的 --port，而非 ss 监听列表首位 29000"
+        );
+        assert_eq!(router.container_name, "sgl-router");
+        assert!(!router.registered);
+        assert!(router.gpus.is_empty());
+    }
 }
