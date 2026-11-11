@@ -44,6 +44,15 @@
   .btn-danger:hover:not(:disabled){background:#fef2f2;border-color:#fecaca}
   .btn-sm{height:30px;padding:0 10px;font-size:12px;border-radius:6px}
   .btn-xs{height:26px;padding:0 8px;font-size:12px;border-radius:6px}
+  /* 文字按钮：用于表格操作列，无边框无底色，悬停浅底 */
+  .btn-text{
+    display:inline-flex; align-items:center; justify-content:center; gap:4px;
+    height:26px; padding:0 6px; border:none; border-radius:6px; background:transparent;
+    color:var(--primary); font-size:12px; font-weight:500; cursor:pointer; white-space:nowrap;
+    font-family:inherit; transition:background .12s,color .12s;
+  }
+  .btn-text:hover:not(:disabled){background:var(--muted)}
+  .btn-text:disabled{opacity:.5;cursor:not-allowed;color:var(--muted-foreground)}
 
   /* ---------- inputs ---------- */
   .label{display:block;font-size:12px;font-weight:500;margin-bottom:6px;color:var(--foreground)}
@@ -603,8 +612,8 @@ async function loadServers() {
         <td class="mono">${s.disk_total_gb ? Math.round(s.disk_used_gb) + " / " + Math.round(s.disk_total_gb) : "-"}</td>
         <td>${statusBadge(s)}</td>
         <td><div class="actions" onclick="event.stopPropagation()">
-          <button class="btn btn-primary btn-xs" onclick="refreshOne(${s.id})">⟳ 刷新</button>
-          <button class="btn btn-ghost btn-xs" title="更多操作" onclick="toggleSrvMenu(event, ${s.id})">⋯</button>
+          <button class="btn-text" onclick="refreshOne(${s.id})">⟳ 刷新</button>
+          <button class="btn-text" title="更多操作" onclick="toggleSrvMenu(event, ${s.id})">⋯</button>
         </div></td>
       </tr>`).join("") || '<tr><td colspan="9" class="empty">暂无服务器</td></tr>';
   } catch (e) { toast(e.message, true); }
@@ -831,10 +840,10 @@ function drvUpgradeBtn(x) {
   const m = (window.DRV_MATRIX || []).find((y) => y.id === x.id);
   const online = m ? m.online : true;
   const target = (window.DRV_ANALYZE && window.DRV_ANALYZE.target) || $("drvTarget").value.trim();
-  if (!online) return `<button class="btn btn-outline btn-sm" disabled title="机器离线，不能升级">⚡ 升级</button>`;
+  if (!online) return `<button class="btn-text" disabled title="机器离线，不能升级">⚡ 升级</button>`;
   if (target && x.current_driver === target)
     return `<span class="badge badge-ok" title="当前驱动已是目标版本">已是目标版本</span>`;
-  return `<button class="btn btn-primary btn-sm" onclick="openDrvUpModal(${x.id})">⚡ 升级</button>`;
+  return `<button class="btn-text" onclick="openDrvUpModal(${x.id})">⚡ 升级</button>`;
 }
 
 async function openDrvUpModal(sid) {
@@ -1014,9 +1023,9 @@ function renderServices() {
       <td>
         <div class="actions" onclick="event.stopPropagation()">
           ${on
-            ? `<button class="btn btn-outline btn-xs" onclick="stopService(${s.id})">⏹ 停止</button>`
-            : `<button class="btn btn-primary btn-xs" onclick="startService(${s.id})">▶ 启动</button>`}
-          <button class="btn btn-ghost btn-xs" title="更多操作" onclick="toggleSvcMenu(event, ${s.id})">⋯</button>
+            ? `<button class="btn-text" onclick="stopService(${s.id})">⏹ 停止</button>`
+            : `<button class="btn-text" onclick="startService(${s.id})">▶ 启动</button>`}
+          <button class="btn-text" title="更多操作" onclick="toggleSvcMenu(event, ${s.id})">⋯</button>
         </div>
       </td>
     </tr>`;
@@ -1040,9 +1049,10 @@ function openRowMenu(e, key, items) {
   el.className = "dropdown-menu";
   el.dataset.key = key;
   el.innerHTML = items.map((it) =>
-    `<button${it.danger ? ' class="danger"' : ""} onclick="${it.fn}">${it.icon ? it.icon + " " : ""}${it.label}</button>${it.sep ? "<hr>" : ""}`
+    `<button${it.danger ? ' class="danger"' : ""} onclick="closeRowMenu(); ${it.fn}">${it.label}</button>${it.sep ? "<hr>" : ""}`
   ).join("");
   document.body.appendChild(el);
+  ROW_MENU = el;
   const r = e.currentTarget.getBoundingClientRect();
   el.style.top = Math.min(r.bottom + 6, window.innerHeight - 230) + "px";
   el.style.left = "auto";
@@ -1052,19 +1062,19 @@ function openRowMenu(e, key, items) {
 }
 function svcMenuItems(id) {
   return [
-    { icon: "✏️", label: "编辑服务", fn: `openServiceModal(${id})` },
-    { icon: "🚚", label: "迁移方案（AI）", fn: `planService(${id})` },
-    { icon: "📦", label: "拷贝模型", fn: `copyModel(${id})` },
-    { sep: true, icon: "🗑", label: "删除服务", fn: `deleteService(${id})`, danger: true },
+    { label: "编辑服务", fn: `openServiceModal(${id})` },
+    { label: "迁移方案（AI）", fn: `planService(${id})` },
+    { label: "拷贝模型", fn: `copyModel(${id})` },
+    { sep: true, label: "删除服务", fn: `deleteService(${id})`, danger: true },
   ];
 }
 function toggleSvcMenu(e, id) { openRowMenu(e, "svc-" + id, svcMenuItems(id)); }
 function srvMenuItems(id) {
   return [
-    { icon: "🧪", label: "SSH 测试", fn: `testServer(${id})` },
-    { icon: "🚀", label: "驱动升级", fn: `openDrvUpModal(${id})` },
-    { icon: "✏️", label: "编辑服务器", fn: `openServerModal(${id})` },
-    { sep: true, icon: "🗑", label: "删除服务器", fn: `deleteServer(${id})`, danger: true },
+    { label: "SSH 测试", fn: `testServer(${id})` },
+    { label: "驱动升级", fn: `openDrvUpModal(${id})` },
+    { label: "编辑服务器", fn: `openServerModal(${id})` },
+    { sep: true, label: "删除服务器", fn: `deleteServer(${id})`, danger: true },
   ];
 }
 function toggleSrvMenu(e, id) { openRowMenu(e, "srv-" + id, srvMenuItems(id)); }

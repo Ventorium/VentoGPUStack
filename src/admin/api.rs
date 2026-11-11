@@ -1094,11 +1094,48 @@ if [ -n "$R" ]; then
   echo "$R"
   exit 1
 fi
+# ---- 先卸载旧 nvidia 模块，使安装器可干净地完成原地安装、驱动立即生效、无需重启。
+#      模块引用通常被 nvidia-persistenced 和监控系统（zabbix 周期性调 nvidia-smi）持有，
+#      故临时停止这些守护进程（非 GPU 工作负载，安装完成后按 is-enabled 状态恢复）。 ----
+PZB=0
+if [ "$(sudo systemctl is-active zabbix-agent 2>/dev/null)" = "active" ] || [ "$(sudo systemctl is-active zabbix-agentd 2>/dev/null)" = "active" ]; then
+  PZB=1
+  echo "[vgs] 临时停止 zabbix-agent（其 nvidia-smi 探测占用旧驱动模块，安装后恢复）..."
+  sudo systemctl stop zabbix-agent zabbix-agentd 2>/dev/null || true
+fi
+PWAS=0
+if [ "$(sudo systemctl is-active nvidia-persistenced 2>/dev/null)" = "active" ]; then
+  PWAS=1
+  echo "[vgs] stopping nvidia-persistenced (持有旧模块引用，安装完成后将恢复)..."
+  sudo systemctl stop nvidia-persistenced || true
+fi
+sudo pkill -9 nvidia-smi 2>/dev/null || true
+sleep 2
+RMOD_FAIL=""
+for m in nvidia_uvm nvidia_drm nvidia_modeset nvidia; do
+  if lsmod | grep -qE "^${{m}}[[:space:]]"; then
+    echo "[vgs] 旧模块 $m 已加载，尝试 rmmod 卸载..."
+    OK=0
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      if sudo rmmod "$m" 2>&1; then OK=1; break; fi
+      sleep 2
+    done
+    if [ "$OK" = "1" ]; then echo "[vgs] 模块 $m 已卸载"; else RMOD_FAIL="$RMOD_FAIL $m"; fi
+  fi
+done
 chmod +x "$F"
 echo "[vgs] running installer (this may take 5-25 min with dkms compile)..."
 sudo sh "$F" --silent --dkms
 IE=$?
 echo "[vgs] installer_exit=$IE"
+if [ "$PWAS" = "1" ] || [ "$(sudo systemctl is-enabled nvidia-persistenced 2>/dev/null)" = "enabled" ]; then
+  sudo systemctl start nvidia-persistenced 2>/dev/null || true
+  echo "[vgs] nvidia-persistenced restored"
+fi
+if [ "$PZB" = "1" ] || [ "$(sudo systemctl is-enabled zabbix-agent 2>/dev/null)" = "enabled" ] || [ "$(sudo systemctl is-enabled zabbix-agentd 2>/dev/null)" = "enabled" ]; then
+  sudo systemctl start zabbix-agent zabbix-agentd 2>/dev/null || true
+  echo "[vgs] zabbix-agent restored"
+fi
 sleep 5
 D=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
 echo "[vgs] driver_now=$D expected=$V"
@@ -1115,7 +1152,11 @@ if [ "$AR" = "1" ]; then
   exit 0
 fi
 echo fail > "$S"
-echo "[vgs] driver not effective (current: $D, expected: $V). 需重启生效，但任务未授权自动重启。"
+if [ -n "$RMOD_FAIL" ]; then
+  echo "[vgs] 驱动未生效：旧模块卸载失败（仍被占用）:$RMOD_FAIL，安装器被中止；请处理占用方后重试。"
+else
+  echo "[vgs] driver not effective (current: $D, expected: $V). 需重启生效，但任务未授权自动重启。"
+fi
 exit 1
 "#
     )
@@ -1267,39 +1308,81 @@ async fn drv_pipeline(
         Err(_) => true,
     };
     if need_download {
-        drv_log(&state, id, format!("从 NVIDIA 官方下载驱动（网关本地缓存）：{url}"));
+        drv_log(&state, id, format!("从 NVIDIA 官方下载驱动（网关本地缓存，断点续传、自动重试）：{url}"));
         let part = format!("{}.part", local.display());
-        let res = tokio::time::timeout(
-            Duration::from_secs(1800),
-            tokio::process::Command::new("curl")
-                .args(["-fSL", "--retry", "2", "--retry-delay", "3", "-o", &part, &url])
-                .output(),
-        )
-        .await;
-        match res {
-            Ok(Ok(o)) if o.status.success() => {
-                if let Err(e) = std::fs::rename(&part, &local) {
-                    let msg = format!("驱动包移动失败: {e}");
+        let mut attempt = 0u32;
+        'download: loop {
+            attempt += 1;
+            if attempt > 1 {
+                let part_mb = std::fs::metadata(&part)
+                    .map(|m| m.len() / 1024 / 1024)
+                    .unwrap_or(0);
+                drv_log(&state, id, format!("下载中断，第 {attempt}/3 次尝试，从 {part_mb} MB 断点续传..."));
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            let res = tokio::time::timeout(
+                Duration::from_secs(1800),
+                tokio::process::Command::new("curl")
+                    .args([
+                        "-fSL",
+                        "-C",
+                        "-",
+                        "--retry",
+                        "3",
+                        "--retry-delay",
+                        "3",
+                        "--retry-all-errors",
+                        "-o",
+                        &part,
+                        &url,
+                    ])
+                    .output(),
+            )
+            .await;
+            match res {
+                Ok(Ok(o)) if o.status.success() => break 'download,
+                Ok(Ok(o)) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    let tail = {
+                        let lines: Vec<&str> = stderr
+                            .split(|c| c == '\n' || c == '\r')
+                            .map(|l| l.trim())
+                            .filter(|l| !l.is_empty())
+                            .collect();
+                        lines.iter().rev().take(3).cloned().collect::<Vec<_>>().join(" | ")
+                    };
+                    if attempt < 3 {
+                        drv_log(&state, id, format!("第 {attempt} 次下载中断（curl 退出码 {}）：{}", o.status.code().unwrap_or(-1), tail));
+                        continue 'download;
+                    }
+                    let msg = format!("驱动下载失败（已尝试 {attempt} 次，curl 退出码 {}）：{}", o.status.code().unwrap_or(-1), tail);
+                    drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+                    return drv_fail(&state, id, msg);
+                }
+                Ok(Err(e)) => {
+                    if attempt < 3 {
+                        drv_log(&state, id, format!("第 {attempt} 次尝试无法执行 curl：{e}"));
+                        continue 'download;
+                    }
+                    let msg = format!("无法执行 curl：{e}");
+                    drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+                    return drv_fail(&state, id, msg);
+                }
+                Err(_) => {
+                    if attempt < 3 {
+                        drv_log(&state, id, format!("第 {attempt} 次下载超过 30 分钟，重试"));
+                        continue 'download;
+                    }
+                    let msg = format!("驱动下载超时（已尝试 {attempt} 次，每次上限 30 分钟）");
                     drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
                     return drv_fail(&state, id, msg);
                 }
             }
-            Ok(Ok(o)) => {
-                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                let msg = format!("驱动下载失败（curl 退出码 {}）：{}", o.status.code().unwrap_or(-1), stderr);
-                drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
-                return drv_fail(&state, id, msg);
-            }
-            Ok(Err(e)) => {
-                let msg = format!("无法执行 curl：{e}");
-                drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
-                return drv_fail(&state, id, msg);
-            }
-            Err(_) => {
-                let msg = "驱动下载超时（>30 分钟）".to_string();
-                drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
-                return drv_fail(&state, id, msg);
-            }
+        }
+        if let Err(e) = std::fs::rename(&part, &local) {
+            let msg = format!("驱动包移动失败: {e}");
+            drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+            return drv_fail(&state, id, msg);
         }
     } else {
         drv_log(&state, id, format!("本地缓存已有驱动包，跳过下载：{}", local.display()));
