@@ -256,10 +256,16 @@
         </div>
       </div>
       <div class="card">
-        <table>
-          <thead><tr><th>名称</th><th>Host</th><th>GPU</th><th>显存</th><th>驱动 / CUDA</th><th>内存</th><th>磁盘</th><th>状态</th><th></th></tr></thead>
-          <tbody id="serverRows"></tbody>
-        </table>
+        <div class="table-wrap">
+          <table class="fixed">
+            <colgroup>
+              <col style="width:180px"><col style="width:152px"><col style="width:56px"><col style="width:92px">
+              <col style="width:168px"><col style="width:90px"><col style="width:92px"><col style="width:88px"><col style="width:132px">
+            </colgroup>
+            <thead><tr><th>名称</th><th>Host</th><th>GPU</th><th>显存</th><th>驱动 / CUDA</th><th>内存</th><th>磁盘</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
+            <tbody id="serverRows"></tbody>
+          </table>
+        </div>
       </div>
     </section>
 
@@ -573,19 +579,17 @@ async function loadServers() {
     SERVERS = r.data.data;
     $("serverRows").innerHTML = SERVERS.map((s) =>
       `<tr style="cursor:pointer" onclick="openDrawer(${s.id})">
-        <td><div class="cell-main">${esc(s.name)}</div><div class="cell-sub">${esc(s.notes || "")}</div></td>
-        <td class="mono">${esc(s.host)}<div class="cell-sub">:${s.port} · ${esc(s.user)}</div></td>
+        <td><div class="cell-main ellipsis" title="${esc(s.name)}">${esc(s.name)}</div><div class="cell-sub ellipsis" title="${esc(s.notes || "")}">${esc(s.notes || "")}</div></td>
+        <td class="mono ellipsis" title="${esc(s.host)}:${s.port} · ${esc(s.user)}"><span class="ellipsis">${esc(s.host)}</span><div class="cell-sub ellipsis">:${s.port} · ${esc(s.user)}</div></td>
         <td>${gpuCell(s)}</td>
         <td class="mono">${s.vram_used_gb ? s.vram_used_gb.toFixed(1) + " / " + s.vram_total_gb.toFixed(0) : "-"}</td>
-        <td><div class="mono">${esc(s.driver_version || "-")}</div><div class="cell-sub mono">CUDA ${esc(s.cuda_version || "-")}</div></td>
+        <td><div class="mono ellipsis" title="${esc(s.driver_version || "-")} / CUDA ${esc(s.cuda_version || "-")}">${esc(s.driver_version || "-")}</div><div class="cell-sub mono ellipsis">CUDA ${esc(s.cuda_version || "-")}</div></td>
         <td class="mono">${s.ram_total_gb ? s.ram_used_gb + " / " + s.ram_total_gb : "-"}</td>
         <td class="mono">${s.disk_total_gb ? Math.round(s.disk_used_gb) + " / " + Math.round(s.disk_total_gb) : "-"}</td>
         <td>${statusBadge(s)}</td>
         <td><div class="actions" onclick="event.stopPropagation()">
-          <button class="btn btn-ghost btn-xs" onclick="testServer(${s.id})">测试</button>
-          <button class="btn btn-ghost btn-xs" onclick="refreshOne(${s.id})">刷新</button>
-          <button class="btn btn-ghost btn-xs" onclick="openServerModal(${s.id})">编辑</button>
-          <button class="btn btn-danger btn-xs" onclick="deleteServer(${s.id})">删除</button>
+          <button class="btn btn-primary btn-xs" onclick="refreshOne(${s.id})">⟳ 刷新</button>
+          <button class="btn btn-ghost btn-xs" title="更多操作" onclick="toggleSrvMenu(event, ${s.id})">⋯</button>
         </div></td>
       </tr>`).join("") || '<tr><td colspan="9" class="empty">暂无服务器</td></tr>';
   } catch (e) { toast(e.message, true); }
@@ -836,36 +840,50 @@ function renderServices() {
   }).join("") || '<tr><td colspan="8" class="empty">暂无模型服务</td></tr>';
 }
 
-/* ---- 行「⋯」下拉菜单 ---- */
-let SVC_MENU = null;
-function closeSvcMenu() {
-  if (!SVC_MENU) return;
-  SVC_MENU.remove();
-  SVC_MENU = null;
-  document.removeEventListener("click", closeSvcMenu);
-  document.removeEventListener("scroll", closeSvcMenu, true);
+/* ---- 行「⋯」下拉菜单（通用：服务 / 服务器列表共用）---- */
+let ROW_MENU = null;
+function closeRowMenu() {
+  if (!ROW_MENU) return;
+  ROW_MENU.remove();
+  ROW_MENU = null;
+  document.removeEventListener("click", closeRowMenu);
+  document.removeEventListener("scroll", closeRowMenu, true);
 }
-function toggleSvcMenu(e, id) {
+function openRowMenu(e, key, items) {
   e.stopPropagation();
-  if (SVC_MENU && SVC_MENU.dataset.id === String(id)) { closeSvcMenu(); return; }
-  closeSvcMenu();
+  if (ROW_MENU && ROW_MENU.dataset.key === key) { closeRowMenu(); return; }
+  closeRowMenu();
   const el = document.createElement("div");
   el.className = "dropdown-menu";
-  el.dataset.id = String(id);
-  el.innerHTML =
-    `<button onclick="openServiceModal(${id})">✏️ 编辑服务</button>` +
-    `<button onclick="planService(${id})">🚚 迁移方案（AI）</button>` +
-    `<button onclick="copyModel(${id})">📦 拷贝模型</button>` +
-    `<hr>` +
-    `<button class="danger" onclick="deleteService(${id})">🗑 删除服务</button>`;
+  el.dataset.key = key;
+  el.innerHTML = items.map((it) =>
+    `<button${it.danger ? ' class="danger"' : ""} onclick="${it.fn}">${it.icon ? it.icon + " " : ""}${it.label}</button>${it.sep ? "<hr>" : ""}`
+  ).join("");
   document.body.appendChild(el);
   const r = e.currentTarget.getBoundingClientRect();
   el.style.top = Math.min(r.bottom + 6, window.innerHeight - 230) + "px";
   el.style.left = "auto";
   el.style.right = Math.max(8, window.innerWidth - r.right) + "px";
-  document.addEventListener("click", closeSvcMenu);
-  document.addEventListener("scroll", closeSvcMenu, true);
+  document.addEventListener("click", closeRowMenu);
+  document.addEventListener("scroll", closeRowMenu, true);
 }
+function svcMenuItems(id) {
+  return [
+    { icon: "✏️", label: "编辑服务", fn: `openServiceModal(${id})` },
+    { icon: "🚚", label: "迁移方案（AI）", fn: `planService(${id})` },
+    { icon: "📦", label: "拷贝模型", fn: `copyModel(${id})` },
+    { sep: true, icon: "🗑", label: "删除服务", fn: `deleteService(${id})`, danger: true },
+  ];
+}
+function toggleSvcMenu(e, id) { openRowMenu(e, "svc-" + id, svcMenuItems(id)); }
+function srvMenuItems(id) {
+  return [
+    { icon: "🧪", label: "SSH 测试", fn: `testServer(${id})` },
+    { icon: "✏️", label: "编辑服务器", fn: `openServerModal(${id})` },
+    { sep: true, icon: "🗑", label: "删除服务器", fn: `deleteServer(${id})`, danger: true },
+  ];
+}
+function toggleSrvMenu(e, id) { openRowMenu(e, "srv-" + id, srvMenuItems(id)); }
 
 function serverOptions(selected, excludeId) {
   return SERVERS.filter((s) => s.enabled && s.id !== excludeId).map((s) =>
@@ -1239,7 +1257,7 @@ function openModal(title, bodyHtml, footBtns, wide) {
 }
 function closeModal() { $("modalOverlay").classList.add("hidden"); }
 $("modalOverlay").addEventListener("mousedown", (e) => { if (e.target === $("modalOverlay")) closeModal(); });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeSvcMenu(); closeModal(); closeDrawer(); } });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeRowMenu(); closeModal(); closeDrawer(); } });
 
 /* ================= 启动 ================= */
 renderTabs();
