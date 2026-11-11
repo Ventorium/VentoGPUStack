@@ -438,6 +438,54 @@ impl ServerStatus {
 }
 
 // ---------------------------------------------------------------------------
+// 驱动升级任务（内存态；目标机 /tmp/vgs_drvup_{id}.status 为执行进度真相源）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DrvTask {
+    pub server_id: u64,
+    pub name: String,
+    pub host: String,
+    /// 当前驱动版本（任务创建时采集）
+    #[serde(default)]
+    pub current_driver: String,
+    pub target_driver: String,
+    #[serde(default)]
+    pub target_cuda: String,
+    /// 阶段：preparing/stopping/download/transferring/installing/reboot-wait/accepting/restarting/done/fail
+    pub phase: String,
+    pub started_at: i64,
+    #[serde(default)]
+    pub auto_reboot: bool,
+    /// 升级前平台停止、成功后需要恢复的服务 id
+    #[serde(default)]
+    pub stopped_services: Vec<u64>,
+    /// 网关侧流水线日志（保留最近 400 行）
+    #[serde(default)]
+    pub log: Vec<String>,
+    /// 目标机安装脚本日志尾部
+    #[serde(default)]
+    pub remote_log: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// 安装后 AI 验收结论 {ok, driver, note}
+    #[serde(default)]
+    pub ai_verdict: Option<serde_json::Value>,
+    /// 升级后服务恢复结果 [{name, ok, error}]
+    #[serde(default)]
+    pub restarted: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub final_driver: String,
+}
+
+impl DrvTask {
+    /// 任务是否仍在执行（未结束）
+    pub fn active(&self) -> bool {
+        !matches!(self.phase.as_str(), "done" | "fail")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 共享运行时状态
 // ---------------------------------------------------------------------------
 
@@ -454,6 +502,8 @@ pub struct AppState {
     /// 是否有全量刷新在进行中
     pub refresh_inflight: std::sync::atomic::AtomicBool,
     pub audit: AuditLog,
+    /// server.id -> 进行中的驱动升级任务（内存态，进程重启即清空）
+    pub drv_tasks: std::sync::Arc<std::sync::Mutex<HashMap<u64, DrvTask>>>,
 }
 
 impl AppState {
@@ -479,6 +529,7 @@ impl AppState {
             statuses: ArcSwap::from_pointee(statuses),
             refresh_inflight: std::sync::atomic::AtomicBool::new(false),
             audit: AuditLog::new(audit_path),
+            drv_tasks: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 

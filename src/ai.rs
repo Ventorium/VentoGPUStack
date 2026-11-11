@@ -137,6 +137,31 @@ pub fn driver_upgrade_prompt(
     )
 }
 
+/// 驱动升级安装后验收 prompt：对照预期驱动版本，检查 nvidia-smi 全量输出。
+pub fn driver_acceptance_prompt(expected_driver: &str, smi_lines: &str) -> String {
+    let data = serde_json::json!({
+        "task": "验收一次刚完成的 NVIDIA 驱动升级是否成功",
+        "expected_driver": expected_driver,
+        "nvidia_smi_output": smi_lines,
+        "check_points": [
+            "nvidia-smi 顶部显示的 Driver Version 是否与 expected_driver 一致（或属于同一主版本升级后允许的新版本）",
+            "GPU 数量是否齐全（每张卡都应出现在列表中，而非缺失或 N/A）",
+            "是否出现 Xid 错误、ECC 异常、温度/功耗 N/A、显存不可读等故障信号",
+        ],
+        "output_format": {
+            "ok": "true 或 false（仅当驱动版本匹配且所有 GPU 健康时为 true）",
+            "driver": "nvidia-smi 中实际显示的 Driver Version 字符串",
+            "gpus_total": "nvidia-smi 中列出的 GPU 总数（整数）",
+            "gpus_ok": "其中状态正常的 GPU 数（整数）",
+            "note": "一句中文验收结论，若失败请说明具体原因"
+        }
+    });
+    format!(
+        "{}\n要求：只基于上面的 nvidia-smi 输出判断，不要编造。最后只输出一个 JSON 对象（不要 markdown 代码块、不要多余文字），严格使用 output_format 的键名。",
+        serde_json::to_string_pretty(&data).unwrap_or_default()
+    )
+}
+
 /// 迁移调度 prompt：选择目标机器与卡，给出完整命令序列。
 pub fn migration_prompt(
     service: &ServiceConf,

@@ -96,6 +96,23 @@ pub struct AnalyzePayload {
     pub target_cuda: String,
 }
 
+#[derive(Deserialize)]
+pub struct DrvUpgradePayload {
+    pub target_driver: String,
+    #[serde(default)]
+    pub target_cuda: String,
+    /// 升级前停止该机上平台托管的运行中服务，成功后自动恢复
+    #[serde(default = "drv_stop_default")]
+    pub stop_services: bool,
+    /// 若安装后驱动未生效且勾选此项，允许自动重启目标机（不勾选则提示手动重启）
+    #[serde(default)]
+    pub auto_reboot: bool,
+}
+
+fn drv_stop_default() -> bool {
+    true
+}
+
 #[derive(Deserialize, Default)]
 pub struct PlanPayload {
     pub to_server_id: Option<u64>,
@@ -311,6 +328,7 @@ pub async fn handle(session: &mut Session, state: &Arc<AppState>) {
         "driver-matrix" => {
             routes_driver_matrix(session, state, &user, &ip, &method, id_part).await
         }
+        "driver-upgrades" if method == "GET" => route_drv_upgrades_list(session, state).await,
         "services" => routes_services(session, state, &user, &ip, &method, id_part, third).await,
         "discover" => {
             routes_discover(session, state, &user, &ip, &method, id_part).await
@@ -509,6 +527,12 @@ async fn routes_servers(
                 ip,
             );
             ok(session, &server_view(&s, Some(&st))).await
+        }
+        ("POST", Some("driver-upgrade")) => {
+            route_drv_upgrade_start(session, state, user, ip, id).await
+        }
+        ("GET", Some("driver-upgrade")) => {
+            route_drv_upgrade_status(session, state, id).await
         }
         _ => fail(session, 405, "method not allowed").await,
     }
@@ -843,6 +867,825 @@ fn rule_driver_analysis(_target: &str, pairs: &[(ServerConf, ServerStatus)]) -> 
 }
 
 // ---------------------------------------------------------------------------
+// 驱动升级执行（平台驱动：预检 → 停服务 → 网关下载 → 传输 → 安装 → 看门狗 → AI 验收 → 恢复服务）
+// ---------------------------------------------------------------------------
+
+/// 驱动版本号校验：三段数字，如 595.71.05
+fn valid_driver_ver(v: &str) -> bool {
+    let parts: Vec<&str> = v.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn drv_snapshot(state: &Arc<AppState>, id: u64) -> Option<DrvTask> {
+    state.drv_tasks.lock().ok().and_then(|m| m.get(&id).cloned())
+}
+
+/// 短暂持锁修改任务（禁止在闭包里 await）
+fn drv_set(state: &Arc<AppState>, id: u64, f: impl FnOnce(&mut DrvTask)) {
+    if let Ok(mut m) = state.drv_tasks.lock() {
+        if let Some(t) = m.get_mut(&id) {
+            f(t);
+        }
+    }
+}
+
+fn drv_log(state: &Arc<AppState>, id: u64, line: String) {
+    drv_set(state, id, |t| {
+        t.log.push(line);
+        if t.log.len() > 400 {
+            t.log.drain(..t.log.len() - 400);
+        }
+    });
+}
+
+fn drv_phase(state: &Arc<AppState>, id: u64, phase: &str) {
+    drv_log(state, id, format!("[phase] {}", phase));
+    drv_set(state, id, |t| t.phase = phase.to_string());
+}
+
+fn drv_fail(state: &Arc<AppState>, id: u64, msg: String) {
+    drv_log(state, id, format!("[error] {}", msg));
+    drv_set(state, id, |t| {
+        t.phase = "fail".to_string();
+        t.error = Some(msg);
+    });
+}
+
+fn drv_audit_fail(state: &Arc<AppState>, user: &str, ip: &str, server: &ServerConf, target: &str, msg: &str) {
+    state.audit.record(
+        user,
+        "driver_upgrade_failed",
+        &format!("{}:{} → {}", server.name, server.host, target),
+        msg,
+        ip,
+    );
+}
+
+/// 规则验收：采集一次，驱动版本与目标一致且 GPU 列表非空
+async fn drv_accept_rule(state: &Arc<AppState>, server: &ServerConf, target: &str) -> bool {
+    let st = collect_and_store(state, server).await;
+    st.online && st.driver_version == target && !st.gpus.is_empty()
+}
+
+/// 恢复升级前停止的平台服务（尽力而为；失败只记录，供前端提示手动启动）
+async fn drv_restore_services(
+    state: &Arc<AppState>,
+    user: &str,
+    ip: &str,
+    server: &ServerConf,
+    ids: &[u64],
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    for sid in ids {
+        let Some(svc) = state.find_service(*sid) else {
+            out.push(json!({"id": sid, "name": format!("#{sid}"), "ok": false, "error": "服务已不存在"}));
+            continue;
+        };
+        if svc.status == ServiceStatus::Running {
+            out.push(json!({"id": sid, "name": svc.name, "ok": true, "error": ""}));
+            continue;
+        }
+        drv_log(state, server.id, format!("恢复服务：{}", svc.name));
+        match start_service_core(state, user, ip, &svc, server.id).await {
+            Ok(_) => out.push(json!({"id": sid, "name": svc.name, "ok": true, "error": ""})),
+            Err((_, e)) => out.push(json!({"id": sid, "name": svc.name, "ok": false, "error": e})),
+        }
+    }
+    out
+}
+
+/// POST /api/servers/{id}/driver-upgrade — 启动驱动升级（立即返回 202，进度经 GET 轮询）
+async fn route_drv_upgrade_start(
+    session: &mut Session,
+    state: &Arc<AppState>,
+    user: &str,
+    ip: &str,
+    id: u64,
+) {
+    let v = parse_body(session).await.unwrap_or(Value::Null);
+    let p: DrvUpgradePayload = match serde_json::from_value(v) {
+        Ok(x) => x,
+        Err(_) => return fail(session, 400, "参数错误：需要 target_driver（如 595.71.05）").await,
+    };
+    let target = p.target_driver.trim().to_string();
+    if target.is_empty() {
+        return fail(session, 400, "target_driver 不能为空").await;
+    }
+    if !valid_driver_ver(&target) {
+        return fail(
+            session,
+            400,
+            &format!("版本号格式不正确：{target}。需要三段数字 X.YY.ZZ，例如 595.71.05"),
+        )
+        .await;
+    }
+    let Some(server) = state.find_server(id) else {
+        return fail(session, 404, "服务器不存在").await;
+    };
+    if !server.enabled {
+        return fail(session, 409, "该服务器已停用，不能升级").await;
+    }
+    let st = match state.status_of(id) {
+        Some(s) => s,
+        None => return fail(session, 409, "该机器状态未知，请先在服务器列表刷新后再升级").await,
+    };
+    if !st.online {
+        return fail(session, 409, &format!("机器离线（{}），不能升级", st.error)).await;
+    }
+    if !st.driver_version.is_empty() && st.driver_version == target {
+        return fail(session, 409, &format!("当前驱动已是 {target}，无需升级")).await;
+    }
+    let busy = state
+        .drv_tasks
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&id).and_then(|t| t.active().then(|| t.name.clone())));
+    if let Some(name) = busy {
+        return fail(
+            session,
+            409,
+            &format!("该机器已有升级任务进行中（{}），请先在升级进度里查看", name),
+        )
+        .await;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let task = DrvTask {
+        server_id: id,
+        name: server.name.clone(),
+        host: server.host.clone(),
+        current_driver: st.driver_version.clone(),
+        target_driver: target.clone(),
+        target_cuda: p.target_cuda.trim().to_string(),
+        phase: "preparing".to_string(),
+        started_at: now,
+        auto_reboot: p.auto_reboot,
+        stopped_services: Vec::new(),
+        log: Vec::new(),
+        remote_log: String::new(),
+        error: None,
+        ai_verdict: None,
+        restarted: Vec::new(),
+        final_driver: String::new(),
+    };
+    if let Ok(mut m) = state.drv_tasks.lock() {
+        m.insert(id, task);
+    }
+    state.audit.record(
+        user,
+        "driver_upgrade_start",
+        &format!("{}:{} → {}", server.name, server.host, target),
+        &format!("stop_services={} auto_reboot={}", p.stop_services, p.auto_reboot),
+        ip,
+    );
+    drv_log(&state, id, format!("升级任务创建：目标 {}（当前 {}）", target, st.driver_version));
+    tokio::spawn(drv_pipeline(
+        state.clone(),
+        user.to_string(),
+        ip.to_string(),
+        id,
+        target.clone(),
+        p.stop_services,
+        p.auto_reboot,
+    ));
+    json(
+        session,
+        202,
+        &json!({"ok": true, "data": {"server_id": id, "phase": "preparing", "target_driver": target}}),
+    )
+    .await
+}
+
+/// 生成目标机安装脚本：写状态文件 /tmp/vgs_drvup_{id}.status（pending/installing/ok/fail/reboot），
+/// 日志 /tmp/vgs_drvup_{id}.log。安装器由目标机自行执行；驱动未即时生效且允许自动重启时才 reboot。
+fn drv_build_install_script(target: &str, fname: &str, status_file: &str, log_file: &str, auto_reboot: bool) -> String {
+    let ar = if auto_reboot { "1" } else { "0" };
+    format!(
+        r#"#!/bin/bash
+V="{target}"
+F="/tmp/{fname}"
+S="{status_file}"
+L="{log_file}"
+AR="{ar}"
+echo installing > "$S"
+exec > "$L" 2>&1
+echo "[vgs] driver upgrade start $(date '+%F %T')"
+if ! dpkg -s dkms >/dev/null 2>&1; then
+  echo "[vgs] installing dkms..."
+  sudo apt-get update -y
+  sudo apt-get install -y dkms
+fi
+H="linux-headers-$(uname -r)"
+if ! dpkg -s "$H" >/dev/null 2>&1; then
+  echo "[vgs] installing $H ..."
+  sudo apt-get update -y
+  sudo apt-get install -y "$H"
+fi
+R=$(nvidia-smi --query-compute-apps=pid,process_name 2>/dev/null | tail -n +2)
+if [ -n "$R" ]; then
+  echo fail > "$S"
+  echo "[vgs] GPU 仍有进程占用，拒绝安装:"
+  echo "$R"
+  exit 1
+fi
+chmod +x "$F"
+echo "[vgs] running installer (this may take 5-25 min with dkms compile)..."
+sudo sh "$F" --silent --dkms
+IE=$?
+echo "[vgs] installer_exit=$IE"
+sleep 5
+D=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
+echo "[vgs] driver_now=$D expected=$V"
+if [ "$D" = "$V" ]; then
+  echo ok > "$S"
+  echo "[vgs] install ok"
+  exit 0
+fi
+if [ "$AR" = "1" ]; then
+  echo reboot > "$S"
+  echo "[vgs] driver not effective yet, rebooting to load new kernel module..."
+  sync
+  sudo reboot
+  exit 0
+fi
+echo fail > "$S"
+echo "[vgs] driver not effective (current: $D, expected: $V). 需重启生效，但任务未授权自动重启。"
+exit 1
+"#
+    )
+}
+
+/// 驱动升级主流水线（tokio::spawn 后台执行）：
+/// (a) 预检 → (b) 停平台服务 → (c) 网关下载 → (d) rsync 传输 → (e) 写脚本并 nohup 启动
+/// 之后交由 drv_finish 看门狗轮询 → 重启等待 → AI 验收 → 恢复服务。
+async fn drv_pipeline(
+    state: Arc<AppState>,
+    user: String,
+    ip: String,
+    id: u64,
+    target: String,
+    stop_services: bool,
+    auto_reboot: bool,
+) {
+    let Some(server) = state.find_server(id) else {
+        drv_fail(&state, id, "服务器不存在（升级期间被删除？）".to_string());
+        return;
+    };
+    let fname = format!("NVIDIA-Linux-x86_64-{target}.run");
+    let mut stopped: Vec<u64> = Vec::new();
+
+    // ---------- (a) 预检 ----------
+    drv_phase(&state, id, "preparing");
+    {
+        let st = collect_and_store(&state, &server).await;
+        if !st.online {
+            drv_audit_fail(&state, &user, &ip, &server, &target, &format!("机器离线: {}", st.error));
+            return drv_fail(&state, id, format!("机器采集失败: {}", st.error));
+        }
+    }
+    {
+        let r = ssh_exec(&server.host, server.port, &server.user, &server.password, "sudo -n true", Duration::from_secs(20)).await;
+        match r {
+            Ok(out) if out.exit_code == 0 => drv_log(&state, id, "预检：免密 sudo 可用".into()),
+            Ok(_) => {
+                let msg = "该机器无免密 sudo，驱动安装需要 root 权限。请先在机器上配置（如 visudo 添加 NOPASSWD），再重新升级".to_string();
+                drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+                return drv_fail(&state, id, msg);
+            }
+            Err(e) => {
+                drv_audit_fail(&state, &user, &ip, &server, &target, &format!("SSH 预检失败: {e}"));
+                return drv_fail(&state, id, format!("SSH 预检失败: {e}"));
+            }
+        }
+    }
+    {
+        let r = ssh_exec(&server.host, server.port, &server.user, &server.password, "df -P /tmp | awk 'NR==2 {print $4}'", Duration::from_secs(20)).await;
+        match r {
+            Ok(out) => {
+                let free_gb = out.stdout.trim().parse::<u64>().unwrap_or(0) as f64 / 1024.0 / 1024.0;
+                if free_gb < 8.0 {
+                    let msg = format!("/tmp 剩余空间不足：仅 {free_gb:.1}GB，至少需要 8GB（驱动包约 3GB）");
+                    drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+                    return drv_fail(&state, id, msg);
+                }
+                drv_log(&state, id, format!("预检：/tmp 剩余 {free_gb:.1}GB，满足要求"));
+            }
+            Err(e) => {
+                drv_audit_fail(&state, &user, &ip, &server, &target, &format!("磁盘空间检查失败: {e}"));
+                return drv_fail(&state, id, format!("磁盘空间检查失败: {e}"));
+            }
+        }
+    }
+
+    // ---------- (b) 停止平台服务 ----------
+    if stop_services {
+        drv_phase(&state, id, "stopping");
+        let running: Vec<ServiceConf> = state
+            .services
+            .load()
+            .as_ref()
+            .services
+            .iter()
+            .filter(|s| s.server_id == id && s.status == ServiceStatus::Running)
+            .cloned()
+            .collect();
+        if running.is_empty() {
+            drv_log(&state, id, "该机器上没有平台服务在运行，无需停止".into());
+        }
+        for svc in &running {
+            drv_log(&state, id, format!("停止服务：{}（{}）", svc.name, svc.model_path));
+            let cmd = deploy::build_stop_cmd(svc);
+            let r = ssh_exec(&server.host, server.port, &server.user, &server.password, &cmd, Duration::from_secs(30)).await;
+            let ok = matches!(&r, Ok(out) if out.exit_code == 0);
+            if let Err(e) = &r {
+                drv_log(&state, id, format!("停止命令执行异常：{e}"));
+            }
+            if ok {
+                stopped.push(svc.id);
+                let mut services = state.services.load().as_ref().clone();
+                if let Some(s) = services.services.iter_mut().find(|x| x.id == svc.id) {
+                    s.status = ServiceStatus::Stopped;
+                    s.pid = None;
+                }
+                if let Err(e) = services.save(&state.main_conf().services_path()) {
+                    drv_log(&state, id, format!("写入 services.yaml 失败: {e}"));
+                }
+                state.services.store(Arc::new(services));
+                drv_log(&state, id, format!("服务已停止：{}", svc.name));
+            } else {
+                drv_log(&state, id, format!("服务停止未确认（安装前会再次核验 GPU 占用）：{}", svc.name));
+            }
+        }
+        if !stopped.is_empty() {
+            drv_set(&state, id, |t| t.stopped_services = stopped.clone());
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let r = ssh_exec(&server.host, server.port, &server.user, &server.password, "nvidia-smi --query-compute-apps=pid,process_name 2>/dev/null | tail -n +2", Duration::from_secs(20)).await;
+        match r {
+            Ok(out) => {
+                let procs: Vec<String> = out.stdout.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+                if !procs.is_empty() {
+                    // 存在非平台纳管的 GPU 进程：绝不强杀 —— 恢复刚停的服务并中止
+                    if !stopped.is_empty() {
+                        drv_log(&state, id, "升级中止，先恢复刚才停止的服务...".into());
+                        let restarted = drv_restore_services(&state, &user, &ip, &server, &stopped).await;
+                        drv_set(&state, id, |t| t.restarted = restarted);
+                    }
+                    let msg = format!("GPU 上存在非平台纳管进程（平台不会强杀未知进程）：{}。请人工处理后重试", procs.join("；"));
+                    drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+                    return drv_fail(&state, id, msg);
+                }
+                drv_log(&state, id, "复检：GPU 已无占用进程".into());
+            }
+            Err(e) => drv_log(&state, id, format!("GPU 占用复检失败（继续，安装脚本内还有最终核验）: {e}")),
+        }
+    }
+
+    // ---------- (c) 网关本地下载（节点无法直连 NVIDIA 官方，由网关代下） ----------
+    drv_phase(&state, id, "download");
+    let url = format!("https://us.download.nvidia.com/tesla/{target}/{fname}");
+    let cache_dir = state
+        .main_conf()
+        .log_dir()
+        .parent()
+        .map(|p| p.join("cache").join("driver"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/opt/ventogpustack/cache/driver"));
+    if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+        let msg = format!("无法创建本地驱动缓存目录 {}: {e}", cache_dir.display());
+        drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+        return drv_fail(&state, id, msg);
+    }
+    let local = cache_dir.join(&fname);
+    let need_download = match std::fs::metadata(&local) {
+        Ok(m) => m.len() < 300_000_000,
+        Err(_) => true,
+    };
+    if need_download {
+        drv_log(&state, id, format!("从 NVIDIA 官方下载驱动（网关本地缓存）：{url}"));
+        let part = format!("{}.part", local.display());
+        let res = tokio::time::timeout(
+            Duration::from_secs(1800),
+            tokio::process::Command::new("curl")
+                .args(["-fSL", "--retry", "2", "--retry-delay", "3", "-o", &part, &url])
+                .output(),
+        )
+        .await;
+        match res {
+            Ok(Ok(o)) if o.status.success() => {
+                if let Err(e) = std::fs::rename(&part, &local) {
+                    let msg = format!("驱动包移动失败: {e}");
+                    drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+                    return drv_fail(&state, id, msg);
+                }
+            }
+            Ok(Ok(o)) => {
+                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                let msg = format!("驱动下载失败（curl 退出码 {}）：{}", o.status.code().unwrap_or(-1), stderr);
+                drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+                return drv_fail(&state, id, msg);
+            }
+            Ok(Err(e)) => {
+                let msg = format!("无法执行 curl：{e}");
+                drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+                return drv_fail(&state, id, msg);
+            }
+            Err(_) => {
+                let msg = "驱动下载超时（>30 分钟）".to_string();
+                drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+                return drv_fail(&state, id, msg);
+            }
+        }
+    } else {
+        drv_log(&state, id, format!("本地缓存已有驱动包，跳过下载：{}", local.display()));
+    }
+    let local_len = match std::fs::metadata(&local).map(|m| m.len()) {
+        Ok(l) => l,
+        Err(e) => {
+            let msg = format!("驱动包缺失: {e}");
+            drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+            return drv_fail(&state, id, msg);
+        }
+    };
+    if local_len < 300_000_000 {
+        let msg = format!("驱动包大小异常（{local_len} 字节），可能下载不完整，请删除本地缓存后重试");
+        drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+        return drv_fail(&state, id, msg);
+    }
+    drv_log(&state, id, format!("本地驱动包就绪：{}（{} MB）", local.display(), local_len / 1024 / 1024));
+
+    // ---------- (d) rsync 传输到目标机 ----------
+    drv_phase(&state, id, "transferring");
+    drv_log(&state, id, format!("rsync 传输到 {}:/tmp/{}（约 {} MB，内网通常数分钟）", server.host, fname, local_len / 1024 / 1024));
+    let ssh_opt = format!("sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p {}", server.port);
+    let remote = format!("{}@{}:/tmp/{}", server.user, server.host, fname);
+    let res = tokio::time::timeout(
+        Duration::from_secs(1800),
+        tokio::process::Command::new("rsync")
+            .args(["-a", "--partial"])
+            .arg("-e")
+            .arg(&ssh_opt)
+            .arg(&local)
+            .arg(&remote)
+            .env("SSHPASS", &server.password)
+            .output(),
+    )
+    .await;
+    match res {
+        Ok(Ok(o)) if o.status.success() => {}
+        Ok(Ok(o)) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let msg = format!("传输到目标机失败（rsync 退出码 {}）：{}", o.status.code().unwrap_or(-1), stderr);
+            drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+            return drv_fail(&state, id, msg);
+        }
+        Ok(Err(e)) => {
+            let msg = format!("无法执行 rsync（确认网关已安装 rsync/sshpass）: {e}");
+            drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+            return drv_fail(&state, id, msg);
+        }
+        Err(_) => {
+            let msg = "传输到目标机超时（>30 分钟）".to_string();
+            drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+            return drv_fail(&state, id, msg);
+        }
+    }
+    let r = ssh_exec(&server.host, server.port, &server.user, &server.password, &format!("stat -c %s /tmp/{fname}"), Duration::from_secs(20)).await;
+    match r {
+        Ok(out) => {
+            let remote_len: u64 = out.stdout.trim().parse().unwrap_or(0);
+            if remote_len != local_len {
+                let msg = format!("目标机文件大小不一致（本地 {local_len} / 远端 {remote_len}），请删除 /tmp/{fname} 后重试");
+                drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+                return drv_fail(&state, id, msg);
+            }
+            drv_log(&state, id, "传输完成，大小校验通过".into());
+        }
+        Err(e) => {
+            let msg = format!("远端文件校验失败: {e}");
+            drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+            return drv_fail(&state, id, msg);
+        }
+    }
+
+    // ---------- (e) 写安装脚本并 nohup 启动（断线不中断） ----------
+    drv_phase(&state, id, "installing");
+    let sh = format!("/tmp/vgs_drvup_{id}.sh");
+    let status_file = format!("/tmp/vgs_drvup_{id}.status");
+    let log_file = format!("/tmp/vgs_drvup_{id}.log");
+    let script = drv_build_install_script(&target, &fname, &status_file, &log_file, auto_reboot);
+    let write_cmd = format!("rm -f {sh} {status_file} {log_file}\ncat > {sh} <<'VGS_DRV_EOF'\n{script}VGS_DRV_EOF\nchmod +x {sh} && echo vgs_script_ok");
+    match ssh_exec(&server.host, server.port, &server.user, &server.password, &write_cmd, Duration::from_secs(60)).await {
+        Ok(out) if out.stdout.contains("vgs_script_ok") => {}
+        Ok(out) => {
+            let msg = format!("安装脚本写入失败：{}", out.stdout.trim());
+            drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+            return drv_fail(&state, id, msg);
+        }
+        Err(e) => {
+            let msg = format!("安装脚本写入失败: {e}");
+            drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+            return drv_fail(&state, id, msg);
+        }
+    }
+    let launch_cmd = format!("nohup bash {sh} >/dev/null 2>&1 & echo $! > /tmp/vgs_drvup_{id}.pid; sleep 1; cat /tmp/vgs_drvup_{id}.pid");
+    match ssh_exec(&server.host, server.port, &server.user, &server.password, &launch_cmd, Duration::from_secs(30)).await {
+        Ok(out) => drv_log(&state, id, format!("安装脚本已在目标机启动（远端 pid {}），进入看门狗轮询", out.stdout.trim())),
+        Err(e) => {
+            let msg = format!("安装脚本启动失败: {e}");
+            drv_audit_fail(&state, &user, &ip, &server, &target, &msg);
+            return drv_fail(&state, id, msg);
+        }
+    }
+
+    // ---------- (f)~(i) 看门狗 / 重启等待 / AI 验收 / 恢复服务 ----------
+    drv_finish(state, user, ip, id, target, stopped, auto_reboot).await;
+}
+
+/// 升级失败统一收尾：先恢复升级前停止的服务，再记审计、置 fail 状态。
+async fn drv_fail_and_restore(
+    state: &Arc<AppState>,
+    user: &str,
+    ip: &str,
+    server: &ServerConf,
+    target: &str,
+    id: u64,
+    stopped: &[u64],
+    msg: String,
+) {
+    if !stopped.is_empty() {
+        drv_log(state, id, "升级失败，先恢复升级前停止的服务...".into());
+        let restarted = drv_restore_services(state, user, ip, server, stopped).await;
+        drv_set(state, id, |t| t.restarted = restarted);
+    }
+    drv_audit_fail(state, user, ip, server, target, &msg);
+    drv_fail(state, id, msg);
+}
+
+/// 看门狗阶段：(f) 轮询远端状态文件 → (g) 重启等待 → (h) AI 验收 → (i) 恢复服务并收尾。
+async fn drv_finish(
+    state: Arc<AppState>,
+    user: String,
+    ip: String,
+    id: u64,
+    target: String,
+    stopped: Vec<u64>,
+    auto_reboot: bool,
+) {
+    let Some(server) = state.find_server(id) else {
+        drv_fail(&state, id, "服务器不存在（升级期间被删除？）".to_string());
+        return;
+    };
+
+    // ---------- (f) 看门狗：轮询远端状态文件（每 8s，最长 35 分钟） ----------
+    let status_file = format!("/tmp/vgs_drvup_{id}.status");
+    let log_file = format!("/tmp/vgs_drvup_{id}.log");
+    let poll_cmd = format!("cat {status_file} 2>/dev/null; echo ---SEP---; tail -n 40 {log_file} 2>/dev/null");
+    enum WatchOutcome {
+        Done,
+        Reboot,
+        Fail(String),
+        Timeout,
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(35 * 60);
+    let mut lost = 0u32;
+    let outcome = loop {
+        if std::time::Instant::now() > deadline {
+            break WatchOutcome::Timeout;
+        }
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        match ssh_exec(&server.host, server.port, &server.user, &server.password, &poll_cmd, Duration::from_secs(20)).await {
+            Ok(out) => {
+                lost = 0;
+                let s = out.stdout.as_str();
+                let (stage, tail) = match s.find("---SEP---") {
+                    Some(i) => (s[..i].trim(), s[i + 9..].trim()),
+                    None => (s.trim(), ""),
+                };
+                if !tail.is_empty() {
+                    drv_set(&state, id, |t| t.remote_log = tail.to_string());
+                }
+                match stage {
+                    "ok" => break WatchOutcome::Done,
+                    "fail" => {
+                        let tail = if tail.is_empty() {
+                            format!("详见目标机安装日志 /tmp/vgs_drvup_{id}.log")
+                        } else {
+                            tail.to_string()
+                        };
+                        break WatchOutcome::Fail(format!("安装脚本报告失败。日志摘录：\n{tail}"));
+                    }
+                    "reboot" => break WatchOutcome::Reboot,
+                    _ => {}
+                }
+            }
+            Err(_) => {
+                lost += 1;
+                if lost % 5 == 0 {
+                    drv_log(&state, id, format!("与目标机失联（连续 {lost} 次），等待恢复..."));
+                }
+                if lost >= 10 {
+                    if auto_reboot {
+                        break WatchOutcome::Reboot;
+                    }
+                    break WatchOutcome::Fail(
+                        "与目标机失联超过 80 秒，且任务未授权自动重启，请人工检查机器状态".to_string(),
+                    );
+                }
+            }
+        }
+    };
+
+    match outcome {
+        WatchOutcome::Done => {
+            drv_log(&state, id, "安装脚本执行成功，驱动版本即时校验通过".into());
+        }
+        WatchOutcome::Reboot => {
+            // ---------- (g) 重启等待 ----------
+            drv_phase(&state, id, "reboot-wait");
+            drv_log(&state, id, "机器重启中，等待其上线并加载新驱动（最长 20 分钟）...".into());
+            let deadline = std::time::Instant::now() + Duration::from_secs(20 * 60);
+            let mut bad = 0u32;
+            let mut last_driver = String::new();
+            let mut recovered = false;
+            while std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                match ssh_exec(
+                    &server.host,
+                    server.port,
+                    &server.user,
+                    &server.password,
+                    "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '",
+                    Duration::from_secs(15),
+                )
+                .await
+                {
+                    Ok(out) => {
+                        let d = out.stdout.trim().to_string();
+                        if !d.is_empty() && d == target {
+                            recovered = true;
+                            drv_log(&state, id, format!("机器已上线，驱动版本 {d} 生效"));
+                            break;
+                        }
+                        if !d.is_empty() {
+                            last_driver = d;
+                        }
+                        bad += 1;
+                        if bad >= 6 {
+                            let msg = if last_driver.is_empty() {
+                                "机器已在线但 nvidia-smi 不可用，驱动未生效，请人工处理".to_string()
+                            } else {
+                                format!("机器已在线但驱动版本非目标（当前 {last_driver}，期望 {target}），请人工处理")
+                            };
+                            return drv_fail_and_restore(&state, &user, &ip, &server, &target, id, &stopped, msg).await;
+                        }
+                    }
+                    Err(_) => {} // 机器仍在重启，继续等
+                }
+            }
+            if !recovered {
+                let msg = "等待机器上线超过 20 分钟仍未确认驱动生效，请人工检查".to_string();
+                return drv_fail_and_restore(&state, &user, &ip, &server, &target, id, &stopped, msg).await;
+            }
+        }
+        WatchOutcome::Fail(msg) => {
+            return drv_fail_and_restore(&state, &user, &ip, &server, &target, id, &stopped, msg).await;
+        }
+        WatchOutcome::Timeout => {
+            let msg = "安装等待超时（>35 分钟仍未完成），请人工检查目标机状态".to_string();
+            return drv_fail_and_restore(&state, &user, &ip, &server, &target, id, &stopped, msg).await;
+        }
+    }
+
+    // ---------- (h) AI 验收（LLM 判断 nvidia-smi 全量输出；失败回退规则） ----------
+    drv_phase(&state, id, "accepting");
+    drv_log(&state, id, "AI 验收：采集 nvidia-smi 全量输出...".into());
+    let smi = match ssh_exec(&server.host, server.port, &server.user, &server.password, "nvidia-smi", Duration::from_secs(30)).await {
+        Ok(out) => out.stdout,
+        Err(e) => {
+            let msg = format!("执行 nvidia-smi 失败: {e}");
+            return drv_fail_and_restore(&state, &user, &ip, &server, &target, id, &stopped, msg).await;
+        }
+    };
+    let llm = state.main_conf().llm.clone();
+    let mut verdict: Option<Value> = None;
+    let (accept_ok, accept_note): (bool, String) = if llm.enabled {
+        match ai::ask_json(&llm, &ai::driver_acceptance_prompt(&target, &smi)).await {
+            Ok(raw) => {
+                let v = ai::unwrap_llm_json(&raw);
+                let v_ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+                let v_driver = v.get("driver").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let v_note = v.get("note").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                verdict = Some(json!({
+                    "ok": v_ok,
+                    "driver": v_driver,
+                    "note": v_note,
+                    "gpus_total": v.get("gpus_total").cloned().unwrap_or(Value::Null),
+                    "gpus_ok": v.get("gpus_ok").cloned().unwrap_or(Value::Null),
+                }));
+                drv_log(&state, id, format!("AI 验收：ok={v_ok} driver={v_driver} note={v_note}"));
+                (v_ok, v_note)
+            }
+            Err(e) => {
+                drv_log(&state, id, format!("AI 验收失败（{e}），回退规则判定"));
+                let r = drv_accept_rule(&state, &server, &target).await;
+                (
+                    r,
+                    if r {
+                        "规则校验通过".to_string()
+                    } else {
+                        "规则校验失败：驱动版本不一致或无 GPU".to_string()
+                    },
+                )
+            }
+        }
+    } else {
+        let r = drv_accept_rule(&state, &server, &target).await;
+        (
+            r,
+            if r {
+                "规则校验通过".to_string()
+            } else {
+                "规则校验失败：驱动版本不一致或无 GPU".to_string()
+            },
+        )
+    };
+    if let Some(v) = &verdict {
+        drv_set(&state, id, |t| t.ai_verdict = Some(v.clone()));
+    }
+    if !accept_ok {
+        let msg = if accept_note.is_empty() {
+            "验收失败".to_string()
+        } else {
+            format!("验收失败：{accept_note}")
+        };
+        return drv_fail_and_restore(&state, &user, &ip, &server, &target, id, &stopped, msg).await;
+    }
+    drv_log(
+        &state,
+        id,
+        format!("验收通过：{}", if accept_note.is_empty() { format!("驱动版本 {target} 生效") } else { accept_note }),
+    );
+
+    // ---------- (i) 恢复服务并收尾 ----------
+    drv_phase(&state, id, "restarting");
+    if stopped.is_empty() {
+        drv_log(&state, id, "无需恢复的服务".into());
+    } else {
+        drv_log(&state, id, format!("恢复升级前停止的 {} 个服务...", stopped.len()));
+        let restarted = drv_restore_services(&state, &user, &ip, &server, &stopped).await;
+        for r in &restarted {
+            let name = r.get("name").and_then(|x| x.as_str()).unwrap_or("?");
+            let r_ok = r.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+            let err = r.get("error").and_then(|x| x.as_str()).unwrap_or("");
+            if r_ok {
+                drv_log(&state, id, format!("服务已恢复：{name}"));
+            } else {
+                drv_log(&state, id, format!("服务恢复失败：{name}（{err}），请在模型服务列表手动启动"));
+            }
+        }
+        drv_set(&state, id, |t| t.restarted = restarted);
+    }
+    let st = collect_and_store(&state, &server).await;
+    let final_driver = st.driver_version.clone();
+    drv_set(&state, id, |t| t.final_driver = final_driver.clone());
+    drv_phase(&state, id, "done");
+    drv_log(&state, id, format!("驱动升级完成：当前驱动 {final_driver}"));
+    state.audit.record(
+        &user,
+        "driver_upgrade_done",
+        &format!("{}:{} → {}", server.name, server.host, target),
+        &format!("final_driver={final_driver}"),
+        &ip,
+    );
+}
+
+/// GET /api/servers/{id}/driver-upgrade — 该机器最近一次（进行中或已完成）升级任务
+async fn route_drv_upgrade_status(session: &mut Session, state: &Arc<AppState>, id: u64) {
+    match drv_snapshot(state, id) {
+        Some(t) => ok(session, &json!({"ok": true, "data": t})).await,
+        None => fail(session, 404, "该机器暂无驱动升级任务（未开始，或进程重启后内存态已清除）").await,
+    }
+}
+
+/// GET /api/driver-upgrades — 全部升级任务（供全局「N 台升级中」角标轮询）
+async fn route_drv_upgrades_list(session: &mut Session, state: &Arc<AppState>) {
+    let tasks: Vec<DrvTask> = state
+        .drv_tasks
+        .lock()
+        .ok()
+        .map(|m| m.values().cloned().collect())
+        .unwrap_or_default();
+    let active = tasks.iter().filter(|t| t.active()).count();
+    json(session, 200, &json!({"ok": true, "data": {"active": active, "tasks": tasks}})).await
+}
+
+// ---------------------------------------------------------------------------
 // 模型服务
 // ---------------------------------------------------------------------------
 
@@ -1153,20 +1996,38 @@ async fn route_start(
     let v = parse_body(session).await.unwrap_or(Value::Null);
     let p: StartPayload = serde_json::from_value(v).unwrap_or_default();
     let target_id = p.server_id.unwrap_or(svc.server_id);
+    match start_service_core(state, user, ip, svc, target_id).await {
+        Ok((pid, gpus, cmd, output, exit_code)) => {
+            ok(
+                session,
+                &json!({"pid": pid, "gpus": gpus, "cmd": cmd, "output": output, "exit_code": exit_code}),
+            )
+            .await
+        }
+        Err((code, msg)) => fail(session, code, &msg).await,
+    }
+}
+
+/// 服务启动核心逻辑（供路由与驱动升级后的服务恢复复用）。
+/// 成功返回 (pid, gpus, cmd, output, exit_code)；失败返回 (HTTP 状态码, 错误信息)。
+async fn start_service_core(
+    state: &Arc<AppState>,
+    user: &str,
+    ip: &str,
+    svc: &ServiceConf,
+    target_id: u64,
+) -> Result<(Option<u32>, Vec<u32>, String, String, i32), (u16, String)> {
     let Some(server) = state.find_server(target_id) else {
-        return fail(session, 404, "目标服务器不存在").await;
+        return Err((404, "目标服务器不存在".to_string()));
     };
     let st = collect_and_store(state, &server).await;
     if !st.online {
-        return fail(session, 502, &format!("目标机器采集失败: {}", st.error)).await;
+        return Err((502, format!("目标机器采集失败: {}", st.error)));
     }
     if st.gpus.is_empty() {
-        return fail(session, 502, "目标机器没有可用的 GPU").await;
+        return Err((502, "目标机器没有可用的 GPU".to_string()));
     }
-    let gpus = match deploy::pick_gpus(&st, svc.tp.max(1), &[]) {
-        Some(g) => g,
-        None => return fail(session, 409, "空闲 GPU 卡数量不足").await,
-    };
+    let gpus = deploy::pick_gpus(&st, svc.tp.max(1), &[]).ok_or_else(|| (409, "空闲 GPU 卡数量不足".to_string()))?;
     let cmd = deploy::build_start_cmd(svc, &gpus);
     let timeout = Duration::from_secs(60);
     match ssh_exec(
@@ -1193,7 +2054,7 @@ async fn route_start(
                 s.pid = pid;
             }
             if let Err(e) = services.save(&state.main_conf().services_path()) {
-                return fail(session, 500, &e).await;
+                return Err((500, e));
             }
             state.services.store(Arc::new(services));
             state.audit.record(
@@ -1203,17 +2064,13 @@ async fn route_start(
                 &format!("gpus={gpus:?} exit={}", out.exit_code),
                 ip,
             );
-            ok(
-                session,
-                &json!({"pid": pid, "gpus": gpus, "cmd": cmd, "output": out_trim, "exit_code": out.exit_code}),
-            )
-            .await
+            Ok((pid, gpus, cmd, out_trim, out.exit_code))
         }
         Err(e) => {
             state
                 .audit
                 .record(user, "start_service_failed", &format!("{}@{}", svc.name, server.host), &e, ip);
-            fail(session, 502, &e).await
+            Err((502, e))
         }
     }
 }

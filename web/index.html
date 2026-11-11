@@ -134,6 +134,18 @@
   .badge-warn{background:#fffbeb;color:var(--warn);border:1px solid #fde68a}
   .badge-err{background:#fef2f2;color:var(--err);border:1px solid #fecaca}
   .badge-muted{background:var(--muted);color:var(--muted-foreground)}
+  .badge-run{background:#eff6ff;color:#2563eb;border:1px solid #bfdbfe}
+
+  /* 驱动升级：进度卡片 + 全局角标 */
+  .drv-progress-card{margin-bottom:14px}
+  .drv-progress-head{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}
+  .drv-log{max-height:220px;overflow-y:auto;font-size:12px;line-height:1.7;white-space:pre-wrap;word-break:break-all;
+    background:#0f172a;color:#cbd5e1;border-radius:8px;padding:10px 12px}
+  .drv-up-chip{position:fixed;right:18px;bottom:18px;z-index:60;display:none;align-items:center;gap:6px;
+    background:#2563eb;color:#fff;border:none;border-radius:999px;padding:9px 16px;font-size:13px;font-weight:600;
+    box-shadow:0 8px 24px rgba(37,99,235,.4);cursor:pointer}
+  .drv-up-chip .pulse{width:8px;height:8px;border-radius:50%;background:#fbbf24;animation:dvpPulse 1.2s infinite}
+  @keyframes dvpPulse{0%{opacity:.4;transform:scale(.8)}50%{opacity:1;transform:scale(1.2)}100%{opacity:.4;transform:scale(.8)}}
 
   /* ---------- modal ---------- */
   .overlay{
@@ -284,11 +296,12 @@
         <div class="section-title" id="drvResultTitle">研判结果</div>
         <div class="card">
           <table>
-            <thead><tr><th>服务器</th><th>当前驱动</th><th>当前 CUDA</th><th>结论</th><th>需先停止的服务</th><th>风险</th><th>理由</th></tr></thead>
+            <thead><tr><th>服务器</th><th>当前驱动</th><th>当前 CUDA</th><th>结论</th><th>需先停止的服务</th><th>风险</th><th>理由</th><th style="width:110px">操作</th></tr></thead>
             <tbody id="drvRows"></tbody>
           </table>
         </div>
       </div>
+      <div id="drvProgress" class="hidden" style="margin-bottom:16px"></div>
       <div class="section-title">当前驱动矩阵</div>
       <div class="card">
         <table>
@@ -387,6 +400,7 @@
 </div>
 
 <div id="toastHost"></div>
+<button id="drvUpChip" class="drv-up-chip" onclick="switchTab('driver')"><span class="pulse"></span><span id="drvUpChipTxt">升级中</span></button>
 
 <script>
 "use strict";
@@ -459,6 +473,7 @@ async function doLogin() {
   $("userChip").textContent = "👤 " + USER;
   showApp();
   switchTab(TAB);
+  startDrvPolling();
 }
 function doLogout() {
   TOKEN = "";
@@ -730,6 +745,7 @@ async function loadDriverMatrix() {
   try {
     const r = await api("/api/driver-matrix");
     const d = r.data.data;
+    window.DRV_MATRIX = d.rows || [];
     if (!$("drvTarget").value) {
       const latest = (d.distinct_drivers || []).sort().pop();
       if (latest) $("drvTarget").value = latest;
@@ -758,6 +774,7 @@ async function analyzeDriver() {
       { target_driver, target_cuda: $("drvCuda").value.trim() }, 300000);
     if (!r.data || !r.data.ok) { toast(r.data && r.data.error || "研判失败", true); return; }
     const d = r.data.data;
+    window.DRV_ANALYZE = { target: d.target_driver, rows: d.servers || [] };
     $("drvResult").classList.remove("hidden");
     $("drvResultTitle").textContent = `研判结果 · 目标 ${d.target_driver} ${d.target_cuda ? "/ CUDA " + d.target_cuda : ""}${d.note ? "（" + d.note + "）" : ""}`;
     $("drvRows").innerHTML = d.servers.map((x) => {
@@ -770,6 +787,7 @@ async function analyzeDriver() {
         <td>${(x.stop_services || []).map((p) => `<span class="badge badge-muted" style="margin:1px 3px 1px 0">${esc(p)}</span>`).join("") || "无"}</td>
         <td>${riskBadge(x.risk)}</td>
         <td style="max-width:340px">${esc(x.reason)}</td>
+        <td style="white-space:nowrap">${drvUpgradeBtn(x)}</td>
       </tr>`;
     }).join("");
     toast("研判完成");
@@ -782,6 +800,171 @@ function riskBadge(r) {
   if (r === "medium") return '<span class="badge badge-warn">中</span>';
   if (r === "high") return '<span class="badge badge-err">高</span>';
   return `<span class="badge badge-muted">${esc(r || "-")}</span>`;
+}
+
+/* ================= 驱动升级执行 ================= */
+window.DRV_MATRIX = [];
+window.DRV_TASKS = [];
+let DRV_POLL_TIMER = null;
+
+function phaseBadge(phase) {
+  const M = {
+    preparing: ["准备中", "badge-muted"],
+    stopping: ["停止服务", "badge-warn"],
+    download: ["下载驱动", "badge-run"],
+    transferring: ["传输中", "badge-run"],
+    installing: ["安装中", "badge-run"],
+    "reboot-wait": ["等待重启", "badge-warn"],
+    accepting: ["AI 验收", "badge-run"],
+    restarting: ["恢复服务", "badge-run"],
+    done: ["完成", "badge-ok"],
+    fail: ["失败", "badge-err"],
+  };
+  const [t, c] = M[phase] || [phase || "未知", "badge-muted"];
+  return `<span class="badge ${c}">${esc(t)}</span>`;
+}
+
+function drvUpgradeBtn(x) {
+  const t = (window.DRV_TASKS || []).find((y) => y.server_id === x.id);
+  if (t && t.phase !== "done" && t.phase !== "fail")
+    return `<span class="badge badge-run" title="任务进行中：${esc(t.phase)} → ${esc(t.target_driver)}">升级中</span>`;
+  const m = (window.DRV_MATRIX || []).find((y) => y.id === x.id);
+  const online = m ? m.online : true;
+  const target = (window.DRV_ANALYZE && window.DRV_ANALYZE.target) || $("drvTarget").value.trim();
+  if (!online) return `<button class="btn btn-outline btn-sm" disabled title="机器离线，不能升级">⚡ 升级</button>`;
+  if (target && x.current_driver === target)
+    return `<span class="badge badge-ok" title="当前驱动已是目标版本">已是目标版本</span>`;
+  return `<button class="btn btn-primary btn-sm" onclick="openDrvUpModal(${x.id})">⚡ 升级</button>`;
+}
+
+async function openDrvUpModal(sid) {
+  const m = (window.DRV_MATRIX || []).find((y) => y.id === sid);
+  const a = (window.DRV_ANALYZE && window.DRV_ANALYZE.rows || []).find((y) => y.id === sid);
+  const target = ($("drvTarget").value || (a && a.current_driver) || "").trim();
+  const body = `
+    <div style="display:flex;gap:24px;margin-bottom:14px;flex-wrap:wrap">
+      <div><div class="label">服务器</div><div class="cell-main">${esc(m ? m.name : "#" + sid)} <span class="cell-sub mono">${esc(m ? m.host : "")}</span></div></div>
+      <div><div class="label">当前驱动</div><div class="mono">${esc((m && m.driver) || (a && a.current_driver) || "-")}</div></div>
+      <div><div class="label">当前 CUDA</div><div class="mono">${esc((m && m.cuda) || (a && a.current_cuda) || "-")}</div></div>
+    </div>
+    <label class="label">目标驱动版本</label>
+    <input class="input mono" id="drvUpTarget" value="${esc(target)}" placeholder="如 595.71.05" style="width:220px">
+    <div style="margin-top:10px"><label class="label">目标 CUDA（可选）</label>
+    <input class="input mono" id="drvUpCuda" value="${esc($("drvCuda").value || "")}" placeholder="如 12.4" style="width:160px"></div>
+    <div style="margin-top:14px">
+      <label style="font-weight:600;cursor:pointer"><input type="checkbox" id="drvUpStop" checked> 升级前停止平台服务，成功后自动恢复（默认开启）</label>
+      <div style="margin:6px 0 0 24px" id="drvUpSvcList"><span class="hint">正在加载服务…</span></div>
+    </div>
+    <label style="font-weight:600;cursor:pointer;margin-top:10px;display:block"><input type="checkbox" id="drvUpReboot"> 若新驱动需重启生效，自动重启该机器（默认关闭）</label>
+    <div class="hint" style="margin-top:10px">全程自动：预检 →（停止服务）→ 网关下载驱动包 → 传输 → DKMS 静默安装 → 看门狗监控 → AI 验收 →（恢复服务）。约 5–30 分钟；GPU 上存在非平台纳管进程时任务会中止，需人工处理。${m && !m.online ? '<b style="color:var(--err)">该机器当前离线，无法升级。</b>' : ""}</div>`;
+  openModal(`驱动升级 · ${m ? m.name : "#" + sid}`, body, [
+    ["取消", "closeModal()"],
+    ["开始升级", `startDrvUp(${sid})`],
+  ], true);
+  // 异步加载服务列表（不阻塞弹窗打开）
+  try {
+    const r = await api("/api/services", "GET", undefined, 120000);
+    const el = $("drvUpSvcList");
+    if (!el) return; // 弹窗已关闭
+    const svcs = ((r.data && r.data.data) || []).filter((s) => s.server_id === sid && s.status === "running");
+    el.innerHTML = svcs.length
+      ? svcs.map((s) => `<span class="badge badge-muted" style="margin:2px 4px 2px 0">${esc(s.name)}</span>`).join("")
+      : '<span class="hint">该机器无运行中的平台服务</span>';
+  } catch (_) {
+    const el = $("drvUpSvcList");
+    if (el) el.innerHTML = '<span class="hint">服务列表获取失败</span>';
+  }
+}
+
+async function startDrvUp(sid) {
+  const target = $("drvUpTarget").value.trim();
+  if (!/^\d+\.\d+\.\d+$/.test(target)) { toast("目标驱动版本格式不正确，如 595.71.05", true); return; }
+  const stop = $("drvUpStop").checked;
+  const reboot = $("drvUpReboot").checked;
+  const btn = $("modalFoot").querySelector(".btn-primary");
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api(`/api/servers/${sid}/driver-upgrade`, "POST", {
+      target_driver: target,
+      target_cuda: $("drvUpCuda").value.trim(),
+      stop_services: stop,
+      auto_reboot: reboot,
+    });
+    if (r.status === 202 && r.data && r.data.ok) {
+      closeModal();
+      toast("升级已开始，进度见驱动升级页或右下角角标");
+      renderDrvProgress();
+    } else {
+      toast((r.data && r.data.error) || "升级发起失败", true);
+      if (btn) btn.disabled = false;
+    }
+  } catch (e) {
+    toast(e.message, true);
+    if (btn) btn.disabled = false;
+  }
+}
+
+function renderDrvProgress() {
+  const host = $("drvProgress");
+  const all = window.DRV_TASKS || [];
+  const active = all.filter((t) => t.phase !== "done" && t.phase !== "fail");
+  const terminal = all
+    .filter((t) => t.phase === "done" || t.phase === "fail")
+    .sort((a, b) => b.started_at - a.started_at)
+    .slice(0, 3);
+  const show = active.concat(terminal);
+  const chip = $("drvUpChip");
+  if (active.length) {
+    $("drvUpChipTxt").textContent = `${active.length} 台升级中`;
+    chip.style.display = "inline-flex";
+  } else {
+    chip.style.display = "none";
+  }
+  if (!show.length) { host.classList.add("hidden"); host.innerHTML = ""; return; }
+  host.classList.remove("hidden");
+  host.innerHTML =
+    '<div class="section-title">升级进度</div>' +
+    show.map((t) => {
+      const logTxt =
+        (t.log || []).slice(-30).join("\n") +
+        (t.remote_log ? "\n--- 目标机日志 ---\n" + t.remote_log : "");
+      let extra = "";
+      if (t.phase === "fail" && t.error) extra += `<div class="hint" style="color:var(--err)">${esc(t.error)}</div>`;
+      if (t.ai_verdict && t.phase === "done") {
+        const v = t.ai_verdict;
+        const g = v.gpus_total != null ? `（GPU ${esc(v.gpus_ok)}/${esc(v.gpus_total)}）` : "";
+        extra += `<div class="hint">AI 验收：${v.ok ? "✅ 通过" : "❌ 未通过"}${v.note ? " · " + esc(v.note) : ""}${g}</div>`;
+      }
+      if (t.restarted && t.restarted.length)
+        extra += `<div class="hint">已恢复服务：${t.restarted.map((r) => esc(r.name) + (r.ok ? "" : "（失败）")).join("、")}</div>`;
+      return `<div class="card drv-progress-card">
+        <div class="drv-progress-head">
+          <div>
+            <div class="cell-main">${esc(t.name)} <span class="cell-sub mono">${esc(t.host)}</span></div>
+            <div class="cell-sub mono">${esc(t.current_driver)} → ${esc(t.target_driver)}</div>
+          </div>
+          ${phaseBadge(t.phase)}
+          <span class="hint">开始于 ${ts(t.started_at)}</span>
+        </div>
+        ${extra}
+        <pre class="drv-log">${esc(logTxt || "（等待日志…）")}</pre>
+      </div>`;
+    }).join("");
+}
+
+function startDrvPolling() {
+  if (DRV_POLL_TIMER) return;
+  const tick = async () => {
+    try {
+      const r = await api("/api/driver-upgrades");
+      if (r.data && r.data.ok) {
+        window.DRV_TASKS = (r.data.data.tasks || []).sort((a, b) => b.started_at - a.started_at);
+        renderDrvProgress();
+      }
+    } catch (_) {}
+  };
+  tick();
+  DRV_POLL_TIMER = setInterval(tick, 4000);
 }
 
 /* ================= 模型服务 ================= */
@@ -879,6 +1062,7 @@ function toggleSvcMenu(e, id) { openRowMenu(e, "svc-" + id, svcMenuItems(id)); }
 function srvMenuItems(id) {
   return [
     { icon: "🧪", label: "SSH 测试", fn: `testServer(${id})` },
+    { icon: "🚀", label: "驱动升级", fn: `openDrvUpModal(${id})` },
     { icon: "✏️", label: "编辑服务器", fn: `openServerModal(${id})` },
     { sep: true, icon: "🗑", label: "删除服务器", fn: `deleteServer(${id})`, danger: true },
   ];
@@ -1268,6 +1452,7 @@ if (TOKEN) {
       $("userChip").textContent = "👤 " + USER;
       showApp();
       switchTab(TAB);
+      startDrvPolling();
     } else showLogin();
   }).catch(() => showLogin());
 } else showLogin();
