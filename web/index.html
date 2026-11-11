@@ -94,7 +94,19 @@
   .cell-main{font-weight:500}
   .cell-sub{font-size:12px;color:var(--muted-foreground);margin-top:2px}
   .empty{padding:56px 0;text-align:center;color:var(--muted-foreground);font-size:13px}
-  .actions{display:flex;gap:4px;justify-content:flex-end;align-items:center;flex-wrap:wrap}
+  .actions{display:flex;gap:4px;justify-content:flex-end;align-items:center;flex-wrap:nowrap}
+  .table-wrap{overflow-x:auto;position:relative}
+  table.fixed{table-layout:fixed;min-width:1060px}
+  .ellipsis{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .spinner{width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--primary);border-radius:50%;animation:spin .7s linear infinite;flex:none}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .loading-overlay{position:absolute;inset:0;z-index:5;background:rgba(255,255,255,.72);display:flex;align-items:center;justify-content:center;gap:8px;font-size:13px;color:var(--muted-foreground);border-radius:var(--radius)}
+  .dropdown-menu{position:fixed;z-index:60;min-width:150px;background:#fff;border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(24,24,27,.12);padding:4px;display:flex;flex-direction:column;gap:2px}
+  .dropdown-menu button{border:none;background:none;text-align:left;padding:7px 10px;font-size:13px;border-radius:6px;cursor:pointer;color:var(--foreground);font-family:inherit}
+  .dropdown-menu button:hover{background:var(--muted)}
+  .dropdown-menu button.danger{color:var(--err)}
+  .dropdown-menu button.danger:hover{background:#fef2f2}
+  .dropdown-menu hr{border:none;border-top:1px solid var(--border);margin:4px 0}
 
   /* ---------- stat cards ---------- */
   .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
@@ -284,17 +296,24 @@
     <section id="page-services" class="hidden">
       <div class="page-head">
         <div><div class="page-title">模型服务调度</div><div class="page-sub">注册 · 启停 · 迁移（蓝绿）· 模型拷贝 · 单卡/多卡（TP）</div></div>
-        <div style="display:flex;gap:8px">
-          <button class="btn btn-outline btn-sm" onclick="loadServices()">⟳ 刷新</button>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span id="svcMeta" class="hint" style="margin:0"></span>
+          <button class="btn btn-outline btn-sm" id="btnSvcRefresh" onclick="loadServices()">⟳ 刷新</button>
           <button class="btn btn-outline btn-sm" id="btnDiscover" onclick="runDiscover()">🔍 智能检测</button>
           <button class="btn btn-primary btn-sm" onclick="openServiceModal()">＋ 注册模型服务</button>
         </div>
       </div>
       <div class="card">
-        <table>
-          <thead><tr><th>服务</th><th>模型路径</th><th>部署方式</th><th>所在机器</th><th>端口</th><th>TP</th><th>状态</th><th></th></tr></thead>
-          <tbody id="serviceRows"></tbody>
-        </table>
+        <div class="table-wrap">
+          <div id="svcLoading" class="loading-overlay hidden"><span class="spinner"></span><span>正在加载服务列表（需逐机探活，约 5–30 秒）…</span></div>
+          <table class="fixed">
+            <colgroup>
+              <col style="width:225px"><col><col style="width:92px"><col style="width:148px"><col style="width:58px"><col style="width:50px"><col style="width:84px"><col style="width:150px">
+            </colgroup>
+            <thead><tr><th>服务</th><th>模型路径</th><th>部署方式</th><th>所在机器</th><th>端口</th><th>TP</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
+            <tbody id="serviceRows"></tbody>
+          </table>
+        </div>
       </div>
     </section>
 
@@ -763,31 +782,89 @@ function riskBadge(r) {
 
 /* ================= 模型服务 ================= */
 let SERVICES = [];
+let SVC_LOADING = false;
 async function loadServices() {
+  if (SVC_LOADING) return;
+  SVC_LOADING = true;
+  const t0 = performance.now();
+  const btn = $("btnSvcRefresh");
+  const ov = $("svcLoading");
+  if (btn) btn.disabled = true;
+  if (ov) ov.classList.remove("hidden");
   try {
-    const [r, srv] = await Promise.all([api("/api/services"), api("/api/servers")]);
+    const [r, srv] = await Promise.all([
+      api("/api/services", "GET", undefined, 120000),
+      api("/api/servers"),
+    ]);
     SERVICES = r.data.data;
     SERVERS = srv.data.data;
-    const srvName = (id) => (SERVERS.find((x) => x.id === id) || {}).host || "-";
-    $("serviceRows").innerHTML = SERVICES.map((s) =>
-      `<tr>
-        <td><div class="cell-main">${esc(s.name)}</div><div class="cell-sub">${esc(s.notes || "")}</div></td>
-        <td class="mono" style="word-break:break-all;max-width:260px">${esc(s.model_path)}</td>
-        <td><span class="badge badge-muted">${esc(s.deploy_type)}</span></td>
-        <td class="mono">${esc(s.server_host || srvName(s.server_id))}</td>
-        <td class="mono">${s.port}</td>
-        <td class="mono">${s.tp}</td>
-        <td>${s.status === "running" ? '<span class="badge badge-on">运行中</span>' : s.status === "migrating" ? '<span class="badge badge-warn">迁移中</span>' : s.status === "error" ? '<span class="badge badge-err">异常</span>' : '<span class="badge badge-off">已停止</span>'}</td>
-        <td><div class="actions" onclick="event.stopPropagation()">
-          <button class="btn btn-ghost btn-xs" onclick="startService(${s.id})">启动</button>
-          <button class="btn btn-ghost btn-xs" onclick="stopService(${s.id})">停止</button>
-          <button class="btn btn-ghost btn-xs" onclick="planService(${s.id})">迁移方案</button>
-          <button class="btn btn-ghost btn-xs" onclick="copyModel(${s.id})">拷贝模型</button>
-          <button class="btn btn-ghost btn-xs" onclick="openServiceModal(${s.id})">编辑</button>
-          <button class="btn btn-danger btn-xs" onclick="deleteService(${s.id})">删除</button>
-        </div></td>
-      </tr>`).join("") || '<tr><td colspan="8" class="empty">暂无模型服务</td></tr>';
+    renderServices();
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    const run = SERVICES.filter((s) => s.status === "running").length;
+    const d = new Date();
+    const p2 = (n) => String(n).padStart(2, "0");
+    $("svcMeta").textContent = `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())} 更新 · ${secs}s · 运行 ${run}/${SERVICES.length}`;
   } catch (e) { toast(e.message, true); }
+  finally {
+    SVC_LOADING = false;
+    if (btn) btn.disabled = false;
+    if (ov) ov.classList.add("hidden");
+  }
+}
+
+function renderServices() {
+  const srvName = (id) => (SERVERS.find((x) => x.id === id) || {}).host || "-";
+  $("serviceRows").innerHTML = SERVICES.map((s) => {
+    const on = s.status === "running" || s.status === "migrating";
+    return `<tr>
+      <td><div class="cell-main ellipsis" title="${esc(s.notes || s.name)}">${esc(s.name)}</div><div class="cell-sub ellipsis" title="${esc(s.notes || "")}">${esc(s.notes || "")}</div></td>
+      <td class="mono ellipsis" title="${esc(s.model_path || "（无模型路径）")}">${esc(s.model_path || "-")}</td>
+      <td><span class="badge badge-muted">${esc(s.deploy_type)}</span></td>
+      <td class="mono ellipsis" title="${esc(s.server_host || srvName(s.server_id))}">${esc(s.server_host || srvName(s.server_id))}</td>
+      <td class="mono">${s.port}</td>
+      <td class="mono">${s.tp}</td>
+      <td>${s.status === "running" ? '<span class="badge badge-on">运行中</span>' : s.status === "migrating" ? '<span class="badge badge-warn">迁移中</span>' : s.status === "error" ? '<span class="badge badge-err">异常</span>' : '<span class="badge badge-off">已停止</span>'}</td>
+      <td>
+        <div class="actions" onclick="event.stopPropagation()">
+          ${on
+            ? `<button class="btn btn-outline btn-xs" onclick="stopService(${s.id})">⏹ 停止</button>`
+            : `<button class="btn btn-primary btn-xs" onclick="startService(${s.id})">▶ 启动</button>`}
+          <button class="btn btn-ghost btn-xs" title="更多操作" onclick="toggleSvcMenu(event, ${s.id})">⋯</button>
+        </div>
+      </td>
+    </tr>`;
+  }).join("") || '<tr><td colspan="8" class="empty">暂无模型服务</td></tr>';
+}
+
+/* ---- 行「⋯」下拉菜单 ---- */
+let SVC_MENU = null;
+function closeSvcMenu() {
+  if (!SVC_MENU) return;
+  SVC_MENU.remove();
+  SVC_MENU = null;
+  document.removeEventListener("click", closeSvcMenu);
+  document.removeEventListener("scroll", closeSvcMenu, true);
+}
+function toggleSvcMenu(e, id) {
+  e.stopPropagation();
+  if (SVC_MENU && SVC_MENU.dataset.id === String(id)) { closeSvcMenu(); return; }
+  closeSvcMenu();
+  const el = document.createElement("div");
+  el.className = "dropdown-menu";
+  el.dataset.id = String(id);
+  el.innerHTML =
+    `<button onclick="openServiceModal(${id})">✏️ 编辑服务</button>` +
+    `<button onclick="planService(${id})">🚚 迁移方案（AI）</button>` +
+    `<button onclick="copyModel(${id})">📦 拷贝模型</button>` +
+    `<hr>` +
+    `<button class="danger" onclick="deleteService(${id})">🗑 删除服务</button>`;
+  document.body.appendChild(el);
+  const r = e.currentTarget.getBoundingClientRect();
+  el.style.top = Math.min(r.bottom + 6, window.innerHeight - 230) + "px";
+  el.style.left = "auto";
+  el.style.right = Math.max(8, window.innerWidth - r.right) + "px";
+  document.addEventListener("click", closeSvcMenu);
+  document.addEventListener("scroll", closeSvcMenu, true);
 }
 
 function serverOptions(selected, excludeId) {
@@ -908,7 +985,7 @@ function renderDiscover(failed) {
         <td class="mono" style="font-size:11px">${esc(drv) || "-"}</td>
         <td class="mono" style="font-size:11px">${box || "-"}</td>
         <td style="white-space:nowrap">${it.registered
-          ? '<span class="badge badge-green">已注册</span>'
+          ? '<span class="badge badge-ok">已注册</span>'
           : `<button class="btn btn-primary btn-sm" onclick="adoptDiscover(${i})">注册</button>`}</td>
       </tr>`;
     });
@@ -929,6 +1006,7 @@ function adoptPayload(it) {
     model_path: it.model_path || "",
     engine: it.engine,
     pid: it.pid,
+    pids: it.pids && it.pids.length ? it.pids : undefined,
     port: it.port || undefined,
     tp: it.tp || undefined,
     extra_args: it.extra_args || "",
@@ -944,6 +1022,11 @@ async function adoptDiscover(i) {
     toast(`已注册「${data.data.name}」`);
     renderDiscover();
     loadServices();
+  } else if (status === 409) {
+    // 已存在于服务列表 → 视为已注册，跳过即可，不算失败
+    it.registered = true;
+    toast(`「${it.model_name || it.proc_name || it.pid}」已注册，跳过`, false);
+    renderDiscover();
   } else {
     toast("注册失败: " + (data.error || status), true);
   }
@@ -952,15 +1035,16 @@ async function adoptDiscover(i) {
 async function adoptAll() {
   const btns = document.querySelectorAll("#modalFoot .btn-primary");
   btns.forEach((b) => { b.disabled = true; b.textContent = "⏳ 注册中…"; });
-  let okN = 0, failN = 0;
+  let okN = 0, failN = 0, skipN = 0;
   for (let i = 0; i < DISCOVERED.length; i++) {
     const it = DISCOVERED[i];
     if (it.registered) continue;
     const { status, data } = await api("/api/discover/adopt", "POST", adoptPayload(it), 30000);
     if (status === 200) { it.registered = true; okN++; }
+    else if (status === 409) { it.registered = true; skipN++; }
     else failN++;
   }
-  toast(`批量注册完成：成功 ${okN}，失败 ${failN}`, failN > 0);
+  toast(`批量注册完成：成功 ${okN}，已注册跳过 ${skipN}，失败 ${failN}`, failN > 0);
   renderDiscover();
   loadServices();
 }
@@ -1155,7 +1239,7 @@ function openModal(title, bodyHtml, footBtns, wide) {
 }
 function closeModal() { $("modalOverlay").classList.add("hidden"); }
 $("modalOverlay").addEventListener("mousedown", (e) => { if (e.target === $("modalOverlay")) closeModal(); });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeModal(); closeDrawer(); } });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeSvcMenu(); closeModal(); closeDrawer(); } });
 
 /* ================= 启动 ================= */
 renderTabs();

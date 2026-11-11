@@ -202,6 +202,8 @@ pub struct Detected {
     pub engine: String,
     /// 服务主 pid（worker 组取主进程 / 父进程 pid）
     pub pid: u32,
+    /// 该进程树内全部 pid（查重/纳管时覆盖「主 pid 变化但子进程仍在」的情况）
+    pub pids: Vec<u32>,
     pub proc_name: String,
     pub gpus: Vec<u32>,
     pub mem_mib: u32,
@@ -749,6 +751,7 @@ pub fn detect(
             cuda_version: cuda_version.clone(),
             engine,
             pid,
+            pids: pids_in.iter().copied().collect(),
             proc_name,
             gpus,
             mem_mib: mem,

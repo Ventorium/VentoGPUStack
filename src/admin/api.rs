@@ -537,8 +537,8 @@ async fn route_server_create(
     if host.is_empty() {
         return fail(session, 400, "host 不能为空").await;
     }
-    let user = p.user.as_deref().map(str::trim).unwrap_or("").to_string();
-    if user.is_empty() {
+    let ssh_user = p.user.as_deref().map(str::trim).unwrap_or("").to_string();
+    if ssh_user.is_empty() {
         return fail(session, 400, "SSH 用户名不能为空").await;
     }
     let mut servers = state.servers.load().as_ref().clone();
@@ -555,7 +555,7 @@ async fn route_server_create(
         name: name.clone(),
         host: host.clone(),
         port: p.port.unwrap_or(22),
-        user: user.clone(),
+        user: ssh_user,
         password: p.password.unwrap_or_default(),
         notes: p.notes.unwrap_or_default(),
         enabled: p.enabled.unwrap_or(true),
@@ -885,6 +885,22 @@ async fn service_alive(svc: &ServiceConf, state: &Arc<AppState>) -> bool {
     {
         return true;
     }
+    // 无模型路径的纳管服务（智能检测注册，如 EngineCore / 容器内服务）：
+    // 直接用采集缓存里的 GPU 进程 pid 判活；缓存缺失或进程不在 GPU 列表时
+    // 才回退 SSH 探测，避免列表接口逐服务串行 SSH。
+    if svc.model_path.is_empty()
+        && svc
+            .pid
+            .map(|pid| {
+                statuses
+                    .get(&svc.server_id)
+                    .map(|x| x.procs.iter().any(|p| p.pid == pid))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    {
+        return true;
+    }
     let Some(pid) = svc.pid else {
         return false;
     };
@@ -988,10 +1004,25 @@ async fn routes_services(
 }
 
 async fn route_services_list(session: &mut Session, state: &Arc<AppState>) {
-    let services = state.services.load();
+    // 并行计算每个服务的存活状态（并发受 ssh_concurrency 限制），
+    // 避免 30+ 个需要 SSH 存活探测的服务串行叠加导致整个列表请求超时。
+    let services = state.services.load().as_ref().clone();
+    let conf = state.main_conf();
+    let sem = Arc::new(tokio::sync::Semaphore::new(conf.ssh_concurrency.max(1) as usize));
+    let mut handles = Vec::new();
+    for s in services.services {
+        let sem = sem.clone();
+        let state = state.clone();
+        handles.push(tokio::spawn(async move {
+            let _perm = sem.acquire().await;
+            service_view(&s, &state).await
+        }));
+    }
     let mut rows: Vec<Value> = Vec::new();
-    for s in services.services.iter() {
-        rows.push(service_view(s, state).await);
+    for h in handles {
+        if let Ok(v) = h.await {
+            rows.push(v);
+        }
     }
     json(session, 200, &json!({"ok": true, "data": rows})).await
 }
@@ -1799,6 +1830,10 @@ struct AdoptPayload {
     model_path: Option<String>,
     engine: Option<String>,
     pid: Option<u32>,
+    /// 检测进程树内全部 pid（查重时覆盖「主 pid 变化但树内仍有旧 pid 注册」的情况）
+    pids: Option<Vec<u32>>,
+    /// 使用中的 GPU 编号（用于生成可区分的默认服务名）
+    gpus: Option<Vec<u32>>,
     port: Option<u16>,
     tp: Option<u32>,
     extra_args: Option<String>,
@@ -1966,22 +2001,33 @@ async fn route_discover_adopt(
     let cmdline = p.cmdline.clone().unwrap_or_default();
 
     let mut services = state.services.load().as_ref().clone();
-    // 查重：同机器同模型路径（互为前缀视为同一模型）或同机器同 pid
+    // 该检测树涉及的全部 pid（主 pid + 同组子进程）
+    let pids: Vec<u32> = match &p.pids {
+        Some(v) if !v.is_empty() => v.clone(),
+        _ => p.pid.into_iter().collect(),
+    };
+    // 查重：同机器同模型路径（互为前缀视为同一模型），或同机器且 pid 在检测树内
+    // （即使已注册服务的 pid 是该进程组的子/父进程，也视为重复，避免重复纳管）
     let dup = services
         .services
         .iter()
         .any(|s| {
             s.server_id == server_id
-                && if !model_path.is_empty() && !s.model_path.is_empty() {
+                && (if !model_path.is_empty() && !s.model_path.is_empty() {
                     s.model_path == model_path
                         || s.model_path.starts_with(&model_path)
                         || model_path.starts_with(&s.model_path)
                 } else {
-                    p.pid.is_some() && s.pid == p.pid
-                }
+                    pids.iter().any(|x| s.pid == Some(*x))
+                })
         });
     if dup {
-        return fail(session, 409, "该机器上已存在相同服务").await;
+        return fail(
+            session,
+            409,
+            "该机器上已存在相同服务（已在服务列表中，无需重复注册）",
+        )
+        .await;
     }
 
     let engine = p.engine.clone().unwrap_or_else(|| "python".to_string());
@@ -1991,7 +2037,10 @@ async fn route_discover_adopt(
         "triton" => DeployType::Docker,
         _ => DeployType::Python,
     };
-    // 名称：模型目录名 → gpu-{机器名}，再保证唯一
+    let gpus = p.gpus.clone().unwrap_or_default();
+    let gpus_str = gpus.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+    // 名称：模型目录名 → 模型标题 → gpu-{机器名}(-gpu{卡号})，再保证唯一。
+    // 无模型路径的进程带 GPU 卡号命名，避免同机多个同类进程都叫 gpu-node07 只能靠 -2/-3 区分。
     let mut name = p
         .name
         .clone()
@@ -2012,7 +2061,12 @@ async fn route_discover_adopt(
             .unwrap_or_default();
     }
     if name.is_empty() {
-        name = format!("gpu-{}", server.name);
+        name = if gpus.is_empty() {
+            format!("gpu-{}", server.name)
+        } else {
+            let g = gpus.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("-");
+            format!("gpu-{}-gpu{}", server.name, g)
+        };
     }
     let mut candidate = name.clone();
     let mut n = 2;
@@ -2046,8 +2100,13 @@ async fn route_discover_adopt(
         status: ServiceStatus::Running,
         pid: p.pid,
         notes: format!(
-            "智能检测纳管（{}）；原命令: {}",
+            "智能检测纳管（{}{}）；原命令: {}",
             engine,
+            if gpus_str.is_empty() {
+                String::new()
+            } else {
+                format!(", GPU {}", gpus_str)
+            },
             cmdline.chars().take(160).collect::<String>()
         ),
     };
